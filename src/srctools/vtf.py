@@ -165,6 +165,9 @@ class ImageFormats(Enum):
     ATI1N = _mk_fmt(size=64)
     ATI2N = _mk_fmt(size=128)
 
+    # Strata source
+    BC7 = _mk_fmt(size=128)
+
     def __repr__(self) -> str:
         """Exclude RGB or A sizes if zero."""
         return self._repr
@@ -286,6 +289,9 @@ class ResourceID(bytes, Enum):
 
     #: Block of keyvalues data.
     KEYVALUES = b'KVD'
+
+    #: Information about auxiliary compression (7.6)
+    AUX_COMPRESSION_INFO = b'AXC'
 
 
 class FilterMode(Enum):
@@ -599,7 +605,7 @@ class VTF:
     depth: int
     mipmap_count: int  #: The total number of mipmaps in the image.
 
-    #: The version number of the file. Supported versions vary from ``(7, 2) - (7, 5)``.
+    #: The version number of the file. Supported versions vary from ``(7, 2) - (7, 6)``.
     version: Tuple[int, int]
     #: An average of the colors in the texture, used to tint light bounced off surfaces.
     reflectivity: Vec
@@ -617,6 +623,10 @@ class VTF:
     #: The image format to use for a small thumbnail, usually ≤ 16×16.
     #: This is usually :py:attr:`DXT1 <srctools.vtf.ImageFormats.DXT1>`.
     low_format: ImageFormats
+
+    deflate_level: int
+    is_deflate_compressed: bool
+    real_image_size: int
 
     _frames: Dict[Tuple[int, Union[CubeSide, int], int], Frame]
     _low_res: Frame
@@ -636,8 +646,8 @@ class VTF:
         depth: int = 1,
     ) -> None:
         """Create a blank VTF file."""
-        if not ((7, 2) <= version <= (7, 5)):
-            raise ValueError(f'Version must be between 7.2 and 7.5! ({version!r})')
+        if not ((7, 2) <= version <= (7, 6)):
+            raise ValueError(f'Version must be between 7.2 and 7.6! ({version!r})')
         if not math.log2(width).is_integer():
             raise ValueError(f"Width must be a power of 2! ({width!r}x{height!r})")
         if not math.log2(height).is_integer():
@@ -703,9 +713,9 @@ class VTF:
             raise ValueError('Bad file signature!')
         version_major, version_minor = struct.unpack('II', file.read(8))
 
-        if version_major != 7 or not (0 <= version_minor <= 5):
+        if version_major != 7 or not (0 <= version_minor <= 6):
             raise ValueError(
-                f"VTF version {version_major}.{version_minor} is not between 7.0-7.5!"
+                f"VTF version {version_major}.{version_minor} is not between 7.0-7.6!"
             )
 
         vtf = cls.__new__(cls)
@@ -741,6 +751,7 @@ class VTF:
         vtf.format = fmt = FORMAT_ORDER[high_format]
         vtf.version = version_major, version_minor
         vtf.low_format = low_fmt = FORMAT_ORDER[low_format]
+        vtf.aux_compression_info = None  # 7.6
 
         if fmt is ImageFormats.NONE:
             raise ValueError('High-res format cannot be missing!')
@@ -795,6 +806,30 @@ class VTF:
                 if isinstance(sheet_data, int):
                     raise ValueError(f'Integer for particle data? {sheet_data!r}')
                 vtf.sheet_info = SheetSequence.from_resource(sheet_data)
+
+            if ResourceID.AUX_COMPRESSION_INFO in vtf.resources:
+                info_resource = vtf.resources[ResourceID.AUX_COMPRESSION_INFO]
+                vtf.deflate_level, = struct.unpack( '<I', info_resource.data[:4] )
+                vtf.is_deflate_compressed = vtf.deflate_level != 0
+
+                if vtf.is_deflate_compressed:
+                    real_size = 0
+                    # decide face count based on the data we already have
+                    if VTFFlags.ENVMAP in vtf.flags:
+                        # 5 -> minor version from which sphere maps are ignored
+                        if vtf.first_frame_index != 0xffff and version_minor < 5:
+                            face_count = 7  # CUBEMAP_FACE_COUNT
+                        else:
+                            face_count = 6  # CUBEMAP_FACE_COUNT - 1
+                    else:
+                        face_count = 1
+                    # calculate real size
+                    for mip in range( vtf.mipmap_count - 1, -1, -1 ):
+                        for frame in range( vtf.frame_count ):
+                            for face in range( face_count ):
+                                offset = ( (vtf.mipmap_count - 1 - mip) * vtf.frame_count * face_count + frame * face_count + face ) * 4 + 4
+                                real_size += struct.unpack( '<I', info_resource.data[ offset : offset + 4 ] )[0]
+                    vtf.real_image_size = real_size
 
         else:
             low_res_offset = header_size
@@ -860,9 +895,9 @@ class VTF:
             version = self.version
         version_major, version_minor = version
 
-        if version_major != 7 or not (0 <= version_minor <= 5):
+        if version_major != 7 or not (0 <= version_minor <= 6):
             raise ValueError(
-                f"VTF version {version_major}.{version_minor} is not between 7.0-7.5!"
+                f"VTF version {version_major}.{version_minor} is not between 7.0-7.6!"
             )
         file.write(struct.pack('<II', version_major, version_minor))
 
@@ -944,8 +979,8 @@ class VTF:
         # Otherwise it's the depth value.
         depth_iter: Iterable[Union[int, CubeSide]]
         if VTFFlags.ENVMAP in self.flags:
-            # For version 7.5, the spheremap is skipped.
-            if version_minor == 5:
+            # For version 7.5 and above, the spheremap is skipped.
+            if version_minor >= 5:
                 depth_iter = CUBES
             else:
                 depth_iter = CUBES_WITH_SPHERE

@@ -811,7 +811,7 @@ ctypedef struct Format:
     bint (*save)(const byte[::1] pixels, byte[::1] data, uint width, uint height) noexcept nogil
 
 
-cdef Format[30] FORMATS
+cdef Format[31] FORMATS
 # Assign directly to each, so Cython doesn't write these to a temp array first
 # in case an exception occurs.
 FORMATS[ 0] = Format("RGBA8888", &size_8888, &load_copy, &save_copy)
@@ -851,6 +851,8 @@ FORMATS[27] = Format("NONE", NULL, NULL, NULL)
 FORMATS[28] = Format("ATI1N", &size_ati1n, NULL, NULL)
 FORMATS[29] = Format("ATI2N", &size_ati2n, &load_ati2n, &save_ati2n)
 
+FORMATS[30] = Format("BC7", NULL, NULL, NULL) # FIXME: Implement
+
 
 def init(formats: 'srctools.vtf.ImageFormats') -> None:
     """Verify that the Python enum matches our array of functions."""
@@ -858,7 +860,7 @@ def init(formats: 'srctools.vtf.ImageFormats') -> None:
     cdef bytes name
     for fmt in formats:
         index = fmt.ind
-        assert 0 <= index < (sizeof(FORMATS) // sizeof(Format))
+        assert 0 <= index < (sizeof(FORMATS) // sizeof(Format)), str(fmt)
         assert strcmp((<str ?>fmt.name).encode('ascii'), FORMATS[index].name) == 0, f'{fmt} != {FORMATS[index].name.decode("ascii")}'
         if FORMATS[index].load != NULL or FORMATS[index].save != NULL:
             assert FORMATS[index].size != NULL, FORMATS[index].name.decode("ascii")
