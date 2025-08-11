@@ -106,6 +106,11 @@ FLAGS_DEFAULT = {
 }
 
 
+T_SPLIT_CHAR = "├──"
+C_DOWN_CHAR = "│  "
+ONE_RIGHT_CHAR = "└──"
+BLANK_CHAR = "   "
+
 class KeyValError(TokenSyntaxError):
     """An error that occurred when parsing a Valve KeyValues file.
 
@@ -941,7 +946,7 @@ class Keyvalues:
             raise LeafKeyvalueError(self, 'iterate')
 
     def iter_tree(self, blocks: builtins.bool = False) -> Iterator['Keyvalues']:
-        """Iterate through all keyvalues in this tree.
+        """Iterate through all keyvalues in this.
 
         This goes through keyvalues in the same order that they will serialise
         into.
@@ -964,6 +969,93 @@ class Keyvalues:
                 yield from kv._iter_tree(blocks)
             else:
                 yield kv
+
+    def repr_as_tree(self, max_elements = 20) -> str:
+        """Represent itself as a tree, similar to the tree command on linux systems.
+        - max_elements - maximum amount of elements per block to show."""
+        if not isinstance(max_elements, int):
+            raise ValueError("Max_elements must be an int!")
+        
+        if self.is_root():
+            return self[0].repr_as_tree(max_elements)
+        
+        if not self.has_children():
+            return f'{self.real_name}: {self.value}\n'
+        
+        done_string = self.real_name + "\n"
+        kv: Keyvalues
+
+        is_block_start = lambda x: not x.startswith((C_DOWN_CHAR, BLANK_CHAR, T_SPLIT_CHAR, ONE_RIGHT_CHAR))
+
+        all_child_lines = []
+
+        for kv in self._value:
+            all_child_lines += kv.repr_as_tree(max_elements).splitlines()
+
+        # Cull blocks after max_elements
+        b_counter = 0
+        i_counter = -1
+        print(f"Processing {all_child_lines}")
+        for line in all_child_lines:
+            i_counter += 1
+
+            if is_block_start(line):
+                b_counter += 1
+
+            if b_counter > max_elements:
+                print(all_child_lines)
+                print(f"Cutting at {i_counter}")
+                all_child_lines = all_child_lines[:i_counter]
+                all_child_lines.append("...")
+                print(all_child_lines)
+                break
+
+
+
+        
+
+
+        last_junction = 0
+
+        # Locate the last junction we'll be connecting to
+        for last_junction in range(len(all_child_lines) - 1, -1, -1):
+            line = all_child_lines[last_junction]
+            if is_block_start(line):
+                break
+
+
+
+
+        previous_line = T_SPLIT_CHAR
+        line_idx = 0
+        
+        while all_child_lines:
+            line = all_child_lines.pop(0)
+            if previous_line.startswith((C_DOWN_CHAR, T_SPLIT_CHAR)):
+                if not is_block_start(line):
+                    # | |-Something
+                    line = C_DOWN_CHAR + " " + line
+                else: # |-Something
+                    if line_idx == last_junction:
+                        line = ONE_RIGHT_CHAR + " " + line
+                    else:
+                        line = T_SPLIT_CHAR + " " + line
+            else:
+                line = BLANK_CHAR + " " + line
+
+            done_string += line + "\n"
+            previous_line = line
+            line_idx += 1
+
+
+        return done_string
+            
+
+            
+
+
+
+
 
     def __contains__(self, key: str) -> builtins.bool:
         """Check to see if a name is present in the children."""
