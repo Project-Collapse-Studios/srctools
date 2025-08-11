@@ -995,7 +995,6 @@ class Keyvalues:
         # Cull blocks after max_elements
         b_counter = 0
         i_counter = -1
-        print(f"Processing {all_child_lines}")
         for line in all_child_lines:
             i_counter += 1
 
@@ -1003,17 +1002,9 @@ class Keyvalues:
                 b_counter += 1
 
             if b_counter > max_elements:
-                print(all_child_lines)
-                print(f"Cutting at {i_counter}")
                 all_child_lines = all_child_lines[:i_counter]
                 all_child_lines.append("...")
-                print(all_child_lines)
                 break
-
-
-
-        
-
 
         last_junction = 0
 
@@ -1022,9 +1013,6 @@ class Keyvalues:
             line = all_child_lines[last_junction]
             if is_block_start(line):
                 break
-
-
-
 
         previous_line = T_SPLIT_CHAR
         line_idx = 0
