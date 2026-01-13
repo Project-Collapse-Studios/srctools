@@ -1,5 +1,6 @@
 """Various useful constants and enums."""
-from typing import Any, MutableMapping
+from typing import Any, Union
+from collections.abc import MutableMapping
 from enum import Enum, Flag
 import sys
 
@@ -10,26 +11,37 @@ __all__ = [
 ]
 
 
-def add_unknown(ns: MutableMapping[str, Any], long: bool = False) -> None:
-    """Add dummy members for :external:class:`enum.Flag` to allow all bits to be set.
+def add_unknown(ns: MutableMapping[str, Any], long: Union[int, bool] = False) -> None:
+    """Adds dummy members for :external:class:`enum.Flag` to allow all bits to be set.
 
-    It should be called at the end of the class body. This is useful to allow for some
-    compatibility with unhandled games, ensuring extra bits are preserved when resaving.
-    All existing bits will be skipped.
+    It should be called at the end of the class body, like so::
+
+        class SomeFlags(Flag):
+            A = 1
+            B = 2
+            C = 16
+            add_unknown(locals())
+        SomeFlags(255) # == SomeFlags.A|B|C|2|3|5|6|7: 255>
+
+    This is useful to allow for some compatibility with unhandled games, ensuring extra bits are
+    preserved when resaving. Each member will be named with the position of its bit.
 
     :param ns: The class namespace to add members to. This should be set to \
         :external:func:`locals()` or :external:func:`vars()`.
-    :param long: If set, extend to 64 bits, not 32 bits.
+    :param long: If True, extend to 64 bits, not 32 bits.
+        Alternatively, pass an integer to specify a specific number of bits.
     """
     # First, determine which bits we already have.
     used_bits = 0
-    for n in ns.values():
-        # Skip non-members added to the namespace.
-        if isinstance(n, int):
+    for name, n in ns.items():
+        # Skip non-members added to the namespace. Python adds things like __firstlineno__.
+        if isinstance(n, int) and not name.startswith('_'):
             used_bits |= n
 
     # The zero bit is always available as a pseudo-flag.
-    for i in range(1, 64 if long else 32):
+    if isinstance(long, bool):
+        long = 64 if long else 32
+    for i in range(1, long):
         bit = 1 << i
         if not bit & used_bits:
             # We don't have to stick to var naming rules, so just name it
@@ -41,22 +53,28 @@ class FileType(Enum):
     """Different kinds of files for Source, mainly to indicate resources to pack.
 
     If this represents a specific file type, the value is the extension. Otherwise, it's an
-    arbitrary integer.
+    arbitrary integer. That occurs for things like soundscript entries which are arbitary names.
     """
+    # Numbers are out of order to preserve cross-version pickling etc.
     GENERIC = 0  #: Arbitrary file type.
     SOUNDSCRIPT = 1  #: Script file containing soundscripts.
 
     GAME_SOUND = 2  #: ``world.blah`` sound - lookup the soundscript, and raw files.
-    PARTICLE = PARTICLE_SYSTEM = 3  #: The name of a particle system.
+    RAW_SOUND = 'wav'  #: A WAV/MP3/OGG sound file.
 
+    PARTICLE = PARTICLE_SYSTEM = 3  #: The name of a particle system.
     PARTICLE_FILE = 'pcf'  #: A particle collection file.
+
+    SOUNDSCAPE_NAME = 8  #: The name of a soundscape.
+    SOUNDSCAPE_FILE = 9  #: Script file containing soundscapes.
 
     VSCRIPT_SQUIRREL = 'nut'  #: Squirrel VScript file.
 
     #: Classname of another entity that this entity includes.
     #: This is only permitted in the FGD file.
     ENTITY = 4
-    #: Name of a function to call defined inside the packlist module.
+    #: Name of a function to call defined inside the packlist module. This is used to mark entities
+    #: which require special handling.
     ENTCLASS_FUNC = 5
 
     #: Randomised generic chunk gibs.
@@ -129,9 +147,7 @@ class GameID(Enum):
 
 
 class SurfFlags(Flag):
-    """The various `SURF_*`_ flags, indicating different attributes for faces.
-
-    .. _SURF_*: https://github.com/ValveSoftware/source-sdk-2013/blob/master/sp/src/public/bspflags.h#L80-L97
+    """The various :sdk-2013:`SURF_*<public/bspflags.h#L80-L97>` flags, indicating different attributes for faces.
     """
     NONE = 0
     LIGHT = 0x1
@@ -171,11 +187,11 @@ class SurfFlags(Flag):
 
 
 class BSPContents(Flag):
-    """The various `CONTENTS_*`_ flags, indicating different collision types.
+    """The various :sdk-2013:`CONTENTS_*<public/bspflags.h#L24-L76>` flags, indicating different collision types.
 
     This is normally for brushes, but is also used on other things like models.
 
-    .. _CONTENTS_*: https://github.com/ValveSoftware/source-sdk-2013/blob/master/sp/src/public/bspflags.h#L24-L76
+    The ``CURRENT_*`` flags are not functional, and their bits were reused in later games.
     """
     EMPTY = 0
     SOLID = 0x1
@@ -209,8 +225,12 @@ class BSPContents(Flag):
     NPC_CLIP = 0x20000
     """Functions like ``tools/toolsclip``."""
 
+    GRENADE_CLIP = 0x80000
+    """Functions like ``tools/toolsgrenadeclip`` from CS:GO."""
+    DRONE_CLIP = 0x100000
+    """Functions like ``tools/toolsdroneclip`` from CS:GO."""
+
     CURRENT_0 = 0x40000
-    """Specifies water currents, can be mixed."""
     CURRENT_90 = 0x80000
     CURRENT_180 = 0x100000
     CURRENT_270 = 0x200000

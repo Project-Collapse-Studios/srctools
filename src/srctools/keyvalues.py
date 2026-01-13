@@ -58,11 +58,9 @@ Keyvalues with children can be indexed by their names, or by a
 
 Handling ``\\n``, ``\\t``, ``\\"``, and ``\\\\`` escape characters can be enabled.
 """
-from typing import (
-    Any, Callable, ClassVar, Dict, Final, Iterable, Iterator, List, Mapping, Optional,
-    Protocol, Tuple, Type, TypeVar, Union, cast,
-)
-from typing_extensions import Literal, TypeAlias, deprecated, overload, ContextManager
+from typing import Any, ClassVar, Final, Optional, Protocol, TypeVar, Union, cast, overload
+from typing_extensions import ContextManager, Literal, TypeAlias, deprecated, Self
+from collections.abc import Callable, Iterable, Iterator, Mapping
 import builtins  # Keyvalues.bool etc shadows these.
 import io
 import keyword
@@ -71,13 +69,14 @@ import sys
 import types
 import warnings
 
-from exceptiongroup import BaseExceptionGroup
-
 from srctools import BOOL_LOOKUP, EmptyMapping, StringPath
 from srctools.math import Vec as _Vec
 from srctools.tokenizer import (
     BaseTokenizer, Token, Tokenizer, TokenSyntaxError, escape_text, format_exc_fileinfo,
 )
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
 
 
 __all__ = ['KeyValError', 'NoKeyError', 'LeafKeyvalueError', 'Keyvalues', 'escape_text']
@@ -85,13 +84,13 @@ __all__ = ['KeyValError', 'NoKeyError', 'LeafKeyvalueError', 'Keyvalues', 'escap
 # Sentinel value to indicate that no default was given to find_key()
 _NO_KEY_FOUND: str = cast(str, object())
 
-_KV_Value = Union[List['Keyvalues'], str, Any]
-_As_Dict_Ret: TypeAlias = Union[str, Dict[str, '_As_Dict_Ret']]
+_KV_Value = Union[list['Keyvalues'], str, Any]
+_As_Dict_Ret: TypeAlias = Union[str, dict[str, '_As_Dict_Ret']]
 
 T = TypeVar('T')
 
 # Various [flags] used after keyvalues names in some Valve files.
-# See https://github.com/ValveSoftware/source-sdk-2013/blob/master/sp/src/tier1/KeyValues.cpp#L2055
+# See https://github.com/ValveSoftware/source-sdk-2013/blob/39f6dde8fbc238727c020d13b05ecadd31bda4c0/src/tier1/KeyValues.cpp#L2218-L2252
 FLAGS_DEFAULT = {
     # We know we're not on a console...
     'x360': False,
@@ -99,11 +98,13 @@ FLAGS_DEFAULT = {
     'gameconsole': False,
 
     'win32': True,  # Not actually windows, it actually means 'PC'
+    'windows': sys.platform == 'win32',
     'osx': sys.platform.startswith('darwin'),
     'linux': sys.platform.startswith('linux'),
-    # Not in the SDK, but shows up in compatible games.
-    'deck': 'steamdeck' in os.environ,
+    # Also means '-gamepadui'.
+    'deck': os.environ.get('steamdeck') == '1' or os.environ.get('steamtenfoot') == '1',
 }
+FLAGS_DEFAULT['posix'] = FLAGS_DEFAULT['osx'] or FLAGS_DEFAULT['linux']
 
 
 T_SPLIT_CHAR = "├──"
@@ -114,7 +115,7 @@ BLANK_CHAR = "   "
 class KeyValError(TokenSyntaxError):
     """An error that occurred when parsing a Valve KeyValues file.
 
-    See the base class :py:class:`TokenSyntaxError` for available attributes.
+    See the base class for available attributes.
     """
 
 
@@ -162,7 +163,7 @@ class _FilenameSetter(ContextManager[str, None]):
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
+        exc_type: Optional[type[BaseException]],
         exc_val: Optional[BaseException],
         exc_tb: Optional[types.TracebackType],
     ) -> None:
@@ -248,7 +249,7 @@ class Keyvalues:
     def __init__(
         self,
         name: str,
-        value: Union[List['Keyvalues'], str],
+        value: Union[list['Keyvalues'], str],
         line_num: Optional[int] = None,
     ) -> None: ...
     @overload
@@ -256,14 +257,14 @@ class Keyvalues:
     def __init__(
         self,
         name: None,
-        value: Union[List['Keyvalues'], str],
+        value: Union[list['Keyvalues'], str],
         line_num: Optional[int] = None,
     ) -> None: ...
 
     def __init__(
         self,
         name: Optional[str],
-        value: Union[List['Keyvalues'], str],
+        value: Union[list['Keyvalues'], str],
         line_num: Optional[int] = None,
     ) -> None:
         """Create a new keyvalues instance."""
@@ -296,11 +297,13 @@ class Keyvalues:
 
     @property
     def name(self) -> str:
-        """Produces a :py:meth:`str.casefold`-ed version of the keyvalue's name. Usually names are case-insensitive.
+        """Produces a :py:meth:`str.casefold`-ed version of the keyvalue's name.
 
+        Usually names are treated as case-insensitive, so this makes it convenient to do comparisons.
         Assigning to this automatically updates both this and :py:attr:`real_name`.
 
-        :deprecated: 'Root' keyvalues have a name of :py:const:`None`. This will be replaced by a blank string, use :py:meth:`is_root()` instead.
+        :deprecated: 'Root' keyvalues have a name of :py:obj:`None`.
+            This will be replaced by a blank string, use :py:meth:`is_root()` instead.
         """
         if self._folded_name is None:
             warnings.warn("The name of root keyvalues will change to a blank string in the future.", DeprecationWarning, 2)
@@ -322,7 +325,8 @@ class Keyvalues:
 
         Assigning to this automatically updates both this and :py:attr:`name`.
 
-        :deprecated: 'Root' keyvalues have a name of :py:const:`None`. This will be replaced by a blank string, use :py:meth:`is_root()` instead.
+        :deprecated: 'Root' keyvalues have a name of :py:obj:`None`.
+            This will be replaced by a blank string, use :py:meth:`is_root()` instead.
         """
         if self._real_name is None:
             warnings.warn("The name of root keyvalues will change to a blank string in the future.", DeprecationWarning, 2)
@@ -338,7 +342,7 @@ class Keyvalues:
             self._real_name = sys.intern(new_name)
             self._folded_name = sys.intern(new_name.casefold())
 
-    def edit(self, name: Optional[str] = None, value: Optional[str] = None) -> 'Keyvalues':
+    def edit(self, name: Optional[str] = None, value: Union[str, list['Keyvalues'], None] = None) -> 'Keyvalues':
         """Simultaneously modify the name and value."""
         if name is not None:
             self._real_name = name
@@ -363,35 +367,74 @@ class Keyvalues:
         kv.line_num = None
         return kv
 
+    # If an explicit tokenizer is provided, many parameters are redundant.
     @staticmethod
+    @overload
     def parse(
-        file_contents: Union[str, BaseTokenizer, Iterator[str]],
+        file_contents: Union[str, Iterable[str]],
         filename: StringPath = '', *,
         flags: Mapping[str, bool] = EmptyMapping,
         newline_keys: bool = False,
         newline_values: bool = True,
+        periodic_callback: Optional[Callable[[], object]] = None,
+        allow_escapes: bool = True,
+        single_line: bool = False,
+    ) -> "Keyvalues": ...
+    @staticmethod
+    @overload
+    def parse(
+        file_contents: BaseTokenizer,
+        filename: StringPath = '', *,
+        flags: Mapping[str, bool] = EmptyMapping,
+        newline_keys: bool = False,
+        newline_values: bool = True,
+        single_line: bool = False,
+        single_block: bool = False,
+    ) -> "Keyvalues": ...
+    @staticmethod
+    def parse(
+        file_contents: Union[str, BaseTokenizer, Iterable[str]],
+        filename: StringPath = '', *,
+        flags: Mapping[str, bool] = EmptyMapping,
+        newline_keys: bool = False,
+        newline_values: bool = True,
+        periodic_callback: Optional[Callable[[], object]] = None,
         allow_escapes: bool = True,
         single_line: bool = False,
         single_block: bool = False,
     ) -> "Keyvalues":
-        """Returns a Keyvalues tree parsed from given text.
+        """Returns a Keyvalues tree parsed from text, a file, or an existing `Tokenizer`.
 
-        :param file_contents: should be an iterable of strings or a single string. Alternatively,
-          file_contents may be an already created tokenizer. In this case ``allow_escapes`` is ignored.
+        Valve's parsers are very inconsistent, sometimes accepting escape sequences, having
+        keyvalues all on the same line and allowing newlines in the middle of text. For this
+        reason many options are provided to fine tune parsing, and determine how strict to treat
+        input.
+
+        :param file_contents: should be an iterable of strings (like a file object) or a
+          single string. Alternatively, file_contents may be an already created tokenizer.
         :param filename: If set this should be the source of the text for debug purposes. If not
-          supplied, ``file_contents.name`` will be used if present.
-        :param single_block: If set, parse a single keyvalues block, instead of a file with multiple
-          roots. Importantly this will exit after hitting this brace, allowing it to be called in
-          the middle of parsing a larger document.
+          supplied, the ``name`` attribute of ``file_contents`` will be used if present.
         :param flags: This should be a mapping for additional ``[flag]`` suffixes to accept.
-        :param allow_escapes: This allows choosing if ``\\t`` or similar escapes are parsed.
         :param single_line: If this is set, allow multiple keyvalues to be on the same line.
           This means unterminated strings will be caught late (if at all), but it allows parsing
           some generated data blocks inside things like `.PHY` files.
         :param newline_keys: This specifies if newline characters are allowed in keys.
-          Keys are prohibited by default, since this is fairly useless, but if quote characters are
-          mismatched it'll catch the mistake early.
+          Keys are prohibited by default, since this is fairly useless. If a quote character is
+          omitted accidentally, this check is likely to quickly catch the error.
         :param newline_values: This specifies if newline characters are allowed in string values.
+
+        The following parameter is only allowed if an explicit `~srctools.tokenizer.Tokenizer`
+        is passed in:
+
+        :param single_block: If set, parse a single keyvalues block, instead of a file with multiple
+          roots. Importantly this will exit after hitting this brace, allowing it to be called in
+          the middle of parsing a larger document.
+
+        These parameters are allowed for strings/files, to initalise the tokenizer:
+
+        :param periodic_callback: If set, this function will be called periodically after every
+          few lines, to allow aborting parsing.
+        :param allow_escapes: This allows choosing if ``\\t`` or similar escapes are parsed.
         """
         # The block we are currently adding to.
 
@@ -405,11 +448,11 @@ class Keyvalues:
         cur_block.line_num = 1
 
         # Cache off the value list.
-        cur_block_contents: List[Keyvalues]
+        cur_block_contents: list[Keyvalues]
         cur_block_contents = cur_block._value = []
         # A queue of the keyvalues we are currently in (outside to inside).
         # And the line numbers of each of these, for error reporting.
-        open_keyvalues: List[Keyvalues] = [cur_block]
+        open_keyvalues: list[Keyvalues] = [cur_block]
 
         # Grab a reference to the token values, so we avoid global lookups.
         STRING: Final = Token.STRING
@@ -423,12 +466,15 @@ class Keyvalues:
             tokenizer.filename = os.fspath(filename)
             tokenizer.error_type = KeyValError
         else:
+            if single_block:
+                raise TypeError("single_block must not be set if a tokenizer is not passed.")
             tokenizer = Tokenizer(
                 file_contents,
                 filename,
                 KeyValError,
                 string_bracket=True,
                 allow_escapes=allow_escapes,
+                periodic_callback=periodic_callback,
             )
 
         # A pseudo-enum to track whether we expect a block next.
@@ -645,7 +691,7 @@ class Keyvalues:
         for kv in self:
             if not isinstance(kv, Keyvalues):
                 raise LeafKeyvalueError(kv, 'find children of')
-            if kv._folded_name == targ_key is not None:
+            if kv._folded_name == targ_key:
                 if depth > 1:
                     if kv.has_children():
                         yield from Keyvalues.find_all(kv, *keys[1:])
@@ -790,8 +836,8 @@ class Keyvalues:
     def bool(self, key: str, def_: Union[builtins.bool, T] = False) -> Union[builtins.bool, T]:
         """Return the value of a boolean key.
 
-        The value may be case-insensitively 'true', 'false', '1', '0', 'T',
-        'F', 'y', 'n', 'yes', or 'no'.
+        The value may be case-insensitively ``true``, ``false``, ``1``, ``0``, ``T``,
+        ``F``, ``y``, ``n``, ``yes``, or ``no``.
         If multiple keys with the same name are present, this will use the
         last only.
         """
@@ -820,7 +866,7 @@ class Keyvalues:
         except NoKeyError:  # key not present, defaults.
             return _Vec(x, y, z)
 
-    def set_key(self, path: Union[Tuple[str, ...], str], value: str) -> None:
+    def set_key(self, path: Union[tuple[str, ...], str], value: str) -> None:
         """Set the value of a key deep in the tree hierarchy.
 
         - If any of the hierarchy do not exist (or do not have children), blank keyvalues will be added automatically.
@@ -880,19 +926,21 @@ class Keyvalues:
             return self._value
 
     @overload
-    def as_array(self) -> List[str]: ...
+    def as_array(self) -> list[str]: ...
     @overload
-    def as_array(self, *, conv: Callable[[str], T]) -> List[T]: ...
+    def as_array(self, *, conv: Callable[[str], T]) -> list[T]: ...
 
-    def as_array(self, *, conv: Callable[[str], T] = cast(Any, str)) -> Union[List[T], List[str]]:
+    def as_array(self, *, conv: Callable[[str], T] = cast(Any, str)) -> Union[list[T], list[str]]:
         """Convert a keyvalue block into a list of values.
 
         If the keyvalue is a single keyvalue, the single value will be
         yielded. Otherwise, each child must be a single value and each
         of those will be yielded. The name is ignored.
+
+        :parameter conv: If provided, this will be called on every value to convert it.
         """
         if isinstance(self._value, list):
-            arr: List[T] = []
+            arr: list[T] = []
             child: Keyvalues
             for child in self._value:
                 if not isinstance(child._value, str):
@@ -1060,11 +1108,11 @@ class Keyvalues:
     @overload
     def __getitem__(self, index: builtins.int) -> 'Keyvalues': ...
     @overload
-    def __getitem__(self, index: slice) -> List['Keyvalues']: ...
+    def __getitem__(self, index: slice) -> list['Keyvalues']: ...
     @overload
     def __getitem__(self, index: str) -> str: ...
     @overload
-    def __getitem__(self, index: Tuple[str, T]) -> Union[str, T]: ...
+    def __getitem__(self, index: tuple[str, T]) -> Union[str, T]: ...
 
     def __getitem__(
         self,
@@ -1072,9 +1120,9 @@ class Keyvalues:
             str,
             builtins.int,
             slice,
-            Tuple[str, Union[str, T]],
+            tuple[str, Union[str, T]],
         ],
-    ) -> Union['Keyvalues', List['Keyvalues'], str, T]:
+    ) -> Union['Keyvalues', list['Keyvalues'], str, T]:
         """Allow indexing the children directly.
 
         - If given an index, it will return the keyvalues in that position.
@@ -1103,7 +1151,7 @@ class Keyvalues:
     @overload
     def __setitem__(self, index: builtins.int, value: 'Keyvalues') -> None: ...
     @overload
-    def __setitem__(self, index: str, value: str) -> None: ...
+    def __setitem__(self, index: str, value: Union[str, 'Keyvalues']) -> None: ...
 
     def __setitem__(
         self,
@@ -1113,7 +1161,8 @@ class Keyvalues:
         """Allow setting the values of the children directly.
 
         - If given an index or slice, it will add these keyvalues in these positions.
-        - If given a string, it will set the last Keyvalue with that name.
+        - If given a string, it will set the last Keyvalue with that name to a string value, or
+          replace with the provided keyvalue.
         - If none are found, it appends the value to the tree.
         """
         if not isinstance(self._value, list):
@@ -1204,7 +1253,7 @@ class Keyvalues:
         else:
             return NotImplemented
 
-    def __iadd__(self, other: Iterable['Keyvalues']) -> 'Keyvalues':
+    def __iadd__(self, other: Iterable['Keyvalues']) -> Self:
         """Extend this keyvalue with the contents of another, or an iterable.
 
         Deprecated behaviour: This also accepts a non-root keyvalue, which will be appended
@@ -1279,7 +1328,7 @@ class Keyvalues:
         folded_names = [name.casefold() for name in names]
         new_list = []
         # Optional only here because _folded_name may be None - it'll never actually be there.
-        merge: Dict[Optional[str], Keyvalues] = {
+        merge: dict[Optional[str], Keyvalues] = {
             name: Keyvalues(name, [])
             for name in folded_names
         }
@@ -1350,14 +1399,16 @@ class Keyvalues:
         indent_braces: builtins.bool = True,
         start_indent: str = '',
     ) -> Optional[str]:
-        """Serialise the keyvalues data to a file, or return as a string.
+        """Serialise the keyvalues data to a file, or return as a string if no file is provided.
 
-        Recursive trees are not permitted.
+        This does not handle cyclic loops in the tree.
 
         :param file: The file to write to. If omitted, the data is returned instead.
-        :param indent: The characters to use for each indentation level.
+        :param indent: The characters to use for each indentation level. Normally spaces/tabs, but
+               any character is accepted.
         :param indent_braces: If enabled, indent the braces to match the block contents, instead of the name.
-        :param start_indent: The initial starting indentation. Useful to allow serialising inside an existing file.
+        :param start_indent: The initial starting indentation. Useful to allow serialising
+               inside an existing file, or to add a prefix like comment delimiters.
         """
         buffer: Optional[io.StringIO] = None
         if file is None:
@@ -1418,7 +1469,6 @@ class Keyvalues:
                 for kv in self._value:
                     yield from kv.export()
             else:
-                assert self._real_name is not None, repr(self)
                 yield f'"{self._real_name}"\n'
                 yield '\t{\n'
                 yield from (
@@ -1507,7 +1557,9 @@ class _Builder:
 
     def __exit__(
         self,
-        exc_type: Type[BaseException], exc_val: BaseException, exc_tb: types.TracebackType,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[types.TracebackType],
     ) -> None:
         """Ends the keyvalue block."""
         pass
@@ -1545,7 +1597,9 @@ class _BuilderElem:
 
     def __exit__(
         self,
-        exc_type: Type[BaseException], exc_val: BaseException, exc_tb: types.TracebackType,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[types.TracebackType],
     ) -> None:
         """End a keyvalue block."""
         self._builder._parents.pop()

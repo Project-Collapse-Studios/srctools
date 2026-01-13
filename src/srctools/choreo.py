@@ -1,6 +1,6 @@
 """Parses VCD choreo scenes, as well as data in scenes.image."""
 from __future__ import annotations
-from typing import IO, ClassVar, Dict, Final, NewType
+from typing import ClassVar, Final, NewType, final
 from typing_extensions import Literal, Self, TypeAlias, assert_never
 from collections.abc import Callable, Iterable, Iterator
 from io import BytesIO
@@ -10,12 +10,22 @@ import struct
 
 import attrs
 
-from srctools import binformat, conv_bool, conv_float, conv_int
-from srctools.tokenizer import BaseTokenizer, Token, escape_text
+from . import binformat, conv_bool, conv_float, conv_int
+from .tokenizer import BaseTokenizer, Token, escape_text
+from .types import FileR, FileRSeek, FileWBinary, FileWText, FileWBinarySeek
+
+__all__ = [
+    'CRC', 'checksum_filename',
+    'Entry', 'parse_scenes_image', 'save_scenes_image_sync',
+    'Scene', 'Actor', 'Channel',
+    'Interpolation', 'CurveType', 'EventType', 'EventFlags', 'CaptionType',
+    'ExpressionSample', 'Tag', 'TimingTag', 'AbsoluteTag', 'CurveEdge', 'Curve',
+    'FlexAnimTrack', 'Event', 'GestureEvent', 'LoopEvent', 'SpeakEvent',
+]
 
 
 CRC = NewType('CRC', int)
-ScenesImage: TypeAlias = Dict[CRC, 'Entry']
+ScenesImage: TypeAlias = dict[CRC, 'Entry']
 # Only known binary version.
 BINARY_VERSION: Final = 4
 FPS_MIN: Final = 10
@@ -226,12 +236,6 @@ NAME_TO_EVENT_TYPE = {
     event.name.casefold(): event
     for event in EventType
 }
-# Match to the index in our list for easier parsing.
-PARAM_KEY_INDEXES = {
-    'param': 0,
-    'param2': 1,
-    'param3': 2,
-}
 NAME_TO_CAPTION_TYPE = {
     'cc_master': CaptionType.Master,
     'cc_slave': CaptionType.Slave,
@@ -258,11 +262,13 @@ class Tag:
     _FACTOR: ClassVar[float] = 255.0
     _MAX: ClassVar[int] = 255
 
+    #: The name for this location.
     name: str
+    #: Value for the tag. Ranges from 0-1, but is encoded into binary with 8 bits of precision.
     value: float = attrs.field(validator=[attrs.validators.ge(0.0), attrs.validators.le(1.0)])
 
     @classmethod
-    def parse_binary(cls, file: IO[bytes], string_pool: list[str], double: bool) -> list[Self]:
+    def parse_binary(cls, file: FileR[bytes], string_pool: list[str], double: bool) -> list[Self]:
         """Parse a list of tags from the file. If double is set, the value is 16-bit not 8-bit."""
         [tag_count] = file.read(1)
         tags = []
@@ -272,7 +278,7 @@ class Tag:
         return tags
 
     @classmethod
-    def export_binary(cls, file: IO[bytes], add_to_pool: Callable[[str], int], tags: list[Self]) -> None:
+    def export_binary(cls, file: FileWBinary, add_to_pool: Callable[[str], int], tags: list[Self]) -> None:
         """Write this to a binary BVCD block."""
         file.write(struct.pack('B', len(tags)))
         for tag in tags:
@@ -297,7 +303,7 @@ class Tag:
         return cls(name, value)
 
     @classmethod
-    def export_text(cls, file: IO[str], indent: str, tags: list[Self], block_name: str) -> None:
+    def export_text(cls, file: FileWText, indent: str, tags: list[Self], block_name: str) -> None:
         """Export a list of tags into a text VCD file."""
         if not tags:
             return
@@ -322,6 +328,7 @@ class TimingTag(Tag):
         """Helper to implement parse_text()."""
         locked = conv_bool(tokenizer.expect(Token.STRING, skip_newline=False))
         return cls(name, value, locked)
+
 
 class AbsoluteTag(Tag):
     """Absolute tags have an increased range and precision."""
@@ -366,7 +373,7 @@ class Curve:
     right: CurveEdge = CurveEdge(False)
 
     @classmethod
-    def parse_binary(cls, file: IO[bytes]) -> Self:
+    def parse_binary(cls, file: FileR[bytes]) -> Self:
         """Parse the BVCD form of this data."""
         [count] = file.read(1)
         ramp = []
@@ -375,7 +382,7 @@ class Curve:
             ramp.append(ExpressionSample(time, value / 255.0))
         return cls(ramp)
 
-    def export_binary(self, file: IO[bytes]) -> None:
+    def export_binary(self, file: FileWBinary) -> None:
         """Write this to a binary BVCD block."""
         file.write(struct.pack('B', len(self.ramp)))
         for sample in self.ramp:
@@ -424,7 +431,7 @@ class Curve:
 
         return cls(ramp, left, right)
 
-    def export_text(self, file: IO[str], indent: str, name: str) -> None:
+    def export_text(self, file: FileWText, indent: str, name: str) -> None:
         """Write this to a text VCD file."""
         if not self.ramp and not self.left.active and not self.right.active:
             return
@@ -455,7 +462,7 @@ class FlexAnimTrack:
     right: CurveEdge = CurveEdge(False)
 
     @classmethod
-    def parse_binary(cls, file: IO[bytes], string_pool: list[str]) -> FlexAnimTrack:
+    def parse_binary(cls, file: FileR[bytes], string_pool: list[str]) -> FlexAnimTrack:
         """Parse the BVCD form of this data."""
         [name_ind, flags, mins, maxes, track_count] = binformat.struct_read('<hBffh', file)
         active = flags & 1 != 0
@@ -488,7 +495,7 @@ class FlexAnimTrack:
             dir_track=dir_track,
         )
 
-    def export_binary(self, file: IO[bytes], add_to_pool: Callable[[str], int]) -> None:
+    def export_binary(self, file: FileWBinary, add_to_pool: Callable[[str], int]) -> None:
         """Write this to a binary BVCD block."""
         flags = 1 * self.active | 2 * (self.dir_track is not None)
         file.write(struct.pack(
@@ -502,7 +509,7 @@ class FlexAnimTrack:
             value = min(255, max(0, round(track.value * 255.0)))
             file.write(struct.pack(
                 '<fBh',
-                track.time, track.value,
+                track.time, value,
                 track.curve_type.export_binary(),
             ))
         if self.dir_track is not None:
@@ -511,11 +518,11 @@ class FlexAnimTrack:
                 value = min(255, max(0, round(track.value * 255.0)))
                 file.write(struct.pack(
                     '<fBh',
-                    track.time, track.value,
+                    track.time, value,
                     track.curve_type.export_binary(),
                 ))
 
-    def export_text(self, file: IO[str], indent: str, default_curve: CurveType) -> None:
+    def export_text(self, file: FileWText, indent: str, default_curve: CurveType) -> None:
         """Write this to a text VCD file."""
         file.write(f'{indent}  "{escape_text(self.name)}"')
         if not self.active:
@@ -618,7 +625,7 @@ class Event:
         return self.end_time != -1.0
 
     @classmethod
-    def parse_binary(cls, file: IO[bytes], string_pool: list[str]) -> Event:
+    def parse_binary(cls, file: FileR[bytes], string_pool: list[str]) -> Event:
         """Parse the BVCD form of this data."""
         [
             type_int, name_ind, start_time, end_time,
@@ -739,7 +746,7 @@ class Event:
                 tag_wav_name=tag_wav_name,
             )
 
-    def export_binary(self, file: IO[bytes], add_to_pool: Callable[[str], int]) -> None:
+    def export_binary(self, file: FileWBinary, add_to_pool: Callable[[str], int]) -> None:
         """Write this to a binary BVCD block."""
         file.write(struct.pack(
             '<bhffhhh',
@@ -799,7 +806,7 @@ class Event:
             ) from None
 
         flags = EventFlags.Active
-        params = ['', '', '']
+        param_1 = param_2 = param_3 = ''
         start_time = 0.0
         end_time = -1.0
 
@@ -839,8 +846,12 @@ class Event:
                         'Invalid duration values {} {}',
                         start_str, end_str,
                     ) from exc
-            elif folded in PARAM_KEY_INDEXES:
-                params[PARAM_KEY_INDEXES[folded]] = tokenizer.expect(Token.STRING, skip_newline=False)
+            elif folded == 'param':
+                param_1 = tokenizer.expect(Token.STRING, skip_newline=False)
+            elif folded == 'param2':
+                param_2 = tokenizer.expect(Token.STRING, skip_newline=False)
+            elif folded == 'param3':
+                param_3 = tokenizer.expect(Token.STRING, skip_newline=False)
             elif folded in NAME_TO_EVENT_FLAG:
                 flags |= NAME_TO_EVENT_FLAG[folded]
             elif folded == "active":
@@ -901,8 +912,7 @@ class Event:
             else:
                 raise tokenizer.error('Unknown event keyvalue "{}"!', key_name)
 
-        param_tup = tuple(params)
-        assert len(param_tup) == 3
+        params = (param_1, param_2, param_3)
 
         # Pick the appropriate type.
         if event_type is EventType.Gesture:
@@ -910,7 +920,7 @@ class Event:
                 name=name,
                 start_time=start_time,
                 end_time=end_time,
-                parameters=param_tup,
+                parameters=params,
                 ramp=ramp,
                 flags=EventFlags(flags),
                 default_curve_type=default_curve_type,
@@ -932,7 +942,7 @@ class Event:
                 name=name,
                 start_time=start_time,
                 end_time=end_time,
-                parameters=param_tup,
+                parameters=params,
                 ramp=ramp,
                 default_curve_type=default_curve_type,
                 flags=EventFlags(flags),
@@ -954,7 +964,7 @@ class Event:
                 name=name,
                 start_time=start_time,
                 end_time=end_time,
-                parameters=param_tup,
+                parameters=params,
                 ramp=ramp,
                 default_curve_type=default_curve_type,
                 flags=EventFlags(flags),
@@ -981,7 +991,7 @@ class Event:
                 name=name,
                 start_time=start_time,
                 end_time=end_time,
-                parameters=param_tup,
+                parameters=params,
                 ramp=ramp,
                 default_curve_type=default_curve_type,
                 flags=EventFlags(flags),
@@ -997,7 +1007,7 @@ class Event:
                 yaw=yaw,
             )
 
-    def export_text(self, file: IO[str], indent: str) -> None:
+    def export_text(self, file: FileWText, indent: str) -> None:
         """Write this to a text VCD file."""
         file.write(f'{indent}event {self.type.name.lower()} "{escape_text(self.name)}"\n')
         file.write(f'{indent}{{\n')
@@ -1102,6 +1112,7 @@ class SpeakEvent(Event):
             assert_never(self.caption_type)
 
 
+@final
 @attrs.define(eq=False)
 class Channel:
     """A channel defines a set of events that an actor performs."""
@@ -1110,7 +1121,7 @@ class Channel:
     events: list[Event] = attrs.Factory(list)
 
     @classmethod
-    def parse_binary(cls, file: IO[bytes], string_pool: list[str]) -> Self:
+    def parse_binary(cls, file: FileR[bytes], string_pool: list[str]) -> Self:
         """Parse the BVCD form of this data."""
         [name_ind, event_count] = binformat.struct_read('<hB', file)
         name = string_pool[name_ind]
@@ -1136,14 +1147,14 @@ class Channel:
                 raise tokenizer.error('Unknown channel keyvalue "{}"!', key_name)
         return channel
 
-    def export_binary(self, file: IO[bytes], add_to_pool: Callable[[str], int]) -> None:
+    def export_binary(self, file: FileWBinary, add_to_pool: Callable[[str], int]) -> None:
         """Write this to a binary BVCD block."""
         file.write(struct.pack('<hB', add_to_pool(self.name), len(self.events)))
         for channel in self.events:
             channel.export_binary(file, add_to_pool)
         file.write(b'\x01' if self.active else b'\x00')
 
-    def export_text(self, file: IO[str], indent: str) -> None:
+    def export_text(self, file: FileWText, indent: str) -> None:
         """Write this to a text VCD file."""
         file.write(f'{indent}channel "{escape_text(self.name)}"\n')
         file.write(f'{indent}{{\n')
@@ -1155,6 +1166,7 @@ class Channel:
         file.write(f'{indent}}}\n')
 
 
+@final
 @attrs.define(eq=False)
 class Actor:
     """An actor in a choreo scene."""
@@ -1164,7 +1176,7 @@ class Actor:
     faceposer_model: str = ''
 
     @classmethod
-    def parse_binary(cls, file: IO[bytes], string_pool: list[str]) -> Self:
+    def parse_binary(cls, file: FileR[bytes], string_pool: list[str]) -> Self:
         """Parse the BVCD form of this data."""
         [name_ind, channel_count] = binformat.struct_read('<hB', file)
         name = string_pool[name_ind]
@@ -1192,14 +1204,14 @@ class Actor:
                 raise tokenizer.error('Unknown actor keyvalue "{}"!', key_name)
         return actor
 
-    def export_binary(self, file: IO[bytes], add_to_pool: Callable[[str], int]) -> None:
+    def export_binary(self, file: FileWBinary, add_to_pool: Callable[[str], int]) -> None:
         """Write this to a binary BVCD block."""
         file.write(struct.pack('<hB', add_to_pool(self.name), len(self.channels)))
         for channel in self.channels:
             channel.export_binary(file, add_to_pool)
         file.write(b'\x01' if self.active else b'\x00')
 
-    def export_text(self, file: IO[str], indent: str) -> None:
+    def export_text(self, file: FileWText, indent: str) -> None:
         """Write this to a text VCD file."""
         file.write(f'{indent}actor "{escape_text(self.name)}"\n')
         file.write(f'{indent}{{\n')
@@ -1213,6 +1225,7 @@ class Actor:
         file.write(f'{indent}}}\n')
 
 
+@final
 @attrs.define(eq=False, kw_only=True)
 class Scene:
     """A choreo scene."""
@@ -1231,7 +1244,7 @@ class Scene:
     scale_settings: dict[str, str] = attrs.Factory(dict)
 
     @classmethod
-    def parse_binary(cls, file: IO[bytes], string_pool: list[str]) -> Self:
+    def parse_binary(cls, file: FileR[bytes], string_pool: list[str]) -> Self:
         """Parse the BVCD form of this data."""
         if file.read(4) != b'bvcd':
             raise ValueError('File is not a binary VCD scene!')
@@ -1337,7 +1350,7 @@ class Scene:
             scale_settings=scale_settings,
         )
 
-    def export_text(self, file: IO[str]) -> None:
+    def export_text(self, file: FileWText) -> None:
         """Write this to a text VCD file."""
         file.write('// Choreo version 1\n')
         for event in self.events:
@@ -1395,7 +1408,7 @@ class Scene:
                     yield caption
 
 
-def parse_scenes_image(file: IO[bytes]) -> ScenesImage:
+def parse_scenes_image(file: FileRSeek[bytes]) -> ScenesImage:
     """Parse the ``scenes.image`` file, extracting all the choreo data."""
     [
         magic,
@@ -1447,7 +1460,7 @@ def parse_scenes_image(file: IO[bytes]) -> ScenesImage:
 
 # noinspection PyProtectedMember
 def save_scenes_image_sync(
-    file: IO[bytes],
+    file: FileWBinarySeek,
     scenes: ScenesImage | Iterable[Entry],
     *,
     version: Literal[2, 3] = 3,
@@ -1455,13 +1468,17 @@ def save_scenes_image_sync(
 ) -> None:
     """Write a new ``scenes.image`` file.
     
-    Binary scenes use a common string pool, meaning that all unparsed scenes must share their pool
-    to be copied over directly.
+    If all unparsed scenes originate from the same scenes.image file, this can directly copy the
+    existing data.
     """
+    scene_list: list[Entry]
     if isinstance(scenes, dict):
         scene_list = list(scenes.values())
     else:
-        scene_list = list(scenes)
+        # Collect into a dict, then back to a sequence - we don't want to allow duplicates.
+        scene_list = list({entry.checksum: entry for entry in scenes}.values())
+    # The entry CRCs must be sorted, since the game uses a binary search.
+    scene_list.sort(key=lambda entry: entry.checksum)
 
     # First, loop through and see if we do have a string pool to reuse.
     pool: list[str] | None = None
@@ -1470,7 +1487,7 @@ def save_scenes_image_sync(
         if isinstance(entry._data, Scene):
             continue
         data, entry_pool = entry._data
-        if pool is None:
+        if pool is None and not two_pools:
             pool = entry_pool
         elif pool is not entry_pool:
             two_pools = True
@@ -1494,8 +1511,6 @@ def save_scenes_image_sync(
         else:
             # Parse if required, then export.
             entry_to_data[entry] = entry.data.export_binary(add_to_pool)
-    # The entry CRCs must be sorted, since the game uses a binary search.
-    scene_list.sort(key=lambda entry: entry.checksum)
 
     # Finally we can start writing to the file.
     file.write(struct.pack('<4siii', b'VSIF', version, len(scene_list), len(pool)))

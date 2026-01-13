@@ -1,22 +1,30 @@
-# cython: language_level=3, auto_pickle=False, binding=True, c_api_binop_methods=True
-# """Optimised Vector object."""
+# cython: language_level=3, auto_pickle=False, binding=True, c_api_binop_methods=True, freethreading_compatible=True
+# """Optimised math objects."""
 from cpython.conversion cimport PyOS_double_to_string
 from cpython.exc cimport PyErr_WarnEx
 from cpython.mem cimport PyMem_Free, PyMem_Malloc
 from cpython.object cimport Py_EQ, Py_GE, Py_GT, Py_LE, Py_LT, Py_NE, PyObject, PyTypeObject
-from cpython.unicode cimport PyUnicode_AsUTF8AndSize
 from cpython.ref cimport Py_INCREF
+from cpython.unicode cimport PyUnicode_AsUTF8AndSize
 from libc cimport math
 from libc.math cimport M_PI, NAN, cos, isnan, llround, sin, tan
 from libc.stdint cimport uint16_t, uint32_t, uint_fast8_t
-from libc.stdio cimport snprintf, sscanf
+from libc.stdio cimport sscanf
 from libc.string cimport memcmp, memcpy, memset
 from libcpp cimport bool
 from libcpp.vector cimport vector
 cimport cython.operator
 
+from .pythoncapi_compat cimport (
+    PyUnicodeWriter, PyUnicodeWriter_Discard, PyUnicodeWriter_Create, PyUnicodeWriter_Finish,
+    PyUnicodeWriter_WriteChar, PyUnicodeWriter_WriteStr,
+    PyUnicodeWriter_WriteUTF8, PyUnicodeWriter_WriteASCII,
+)
+
 from srctools cimport quickhull
 
+# Free-threading: We add critical sections around all vec_t/mat_t accesses, except for
+# known frozen objects, or newly-created and therefore inacessible objects.
 
 cdef inline Vec _vector_mut(double x, double y, double z):
     """Make a mutable Vector directly."""
@@ -81,8 +89,9 @@ cdef inline MatrixBase _matrix(type typ):
     else:
         return <MatrixBase>Matrix.__new__(Matrix)
 
-cdef object typing  # Keep private.
-import typing
+from typing import Union
+from collections.abc import Iterable, Iterator
+from types import MappingProxyType
 
 
 # Shared functions that we use to do unpickling.
@@ -141,131 +150,113 @@ cdef inline object _make_tuple(object x, object y, object z):
             return tuple_new(Vec_tuple, tup)
 
 
-cdef inline double norm_ang(double val) except? NAN:
+cdef inline double norm_ang(double val) noexcept nogil:
     """Normalise an angle to 0-360."""
     # We have to double-modulus because -1e-14 % 360.0 = 360.0.
     val = val % 360.0 % 360.0
     return val
 
 
-cdef Py_ssize_t trim_float(char *buf, Py_ssize_t size) except -1:
-    """Strip a .0 from the end of a float."""
+cdef Py_ssize_t calc_trim_float(const char *buf, Py_ssize_t size) noexcept:
+    """We want to strip .0 from the end of a float.
+    
+    If 0, the float is '-0', so it should be replaced by '0'. Otherwise, this
+    calculates the length to trim to, without modifying the buffer so we can read straight
+    from a string object.
+    """
     while size > 1 and buf[size - 1] == b'0':
-        buf[size - 1] = 0
         size -= 1
     if size > 1 and buf[size - 1] == b'.':
-        buf[size - 1] = 0
         size -= 1
+    if size == 2 and buf[0] == b'-' and buf[1] == b'0':
+        return 0
     return size
 
 
-cdef char * _format_float(double x, int places) except NULL:
+cdef int _write_float(PyUnicodeWriter *writer, double x, int places) except -1:
     """Convert the specified float to a string, stripping off a .0 if it ends with that."""
     cdef char *buf
+    cdef Py_ssize_t trim_size
     buf = PyOS_double_to_string(x + 0.0, b'f', places, 0, NULL)
-    trim_float(buf, len(buf))
-    return buf
-
-
-cdef str _format_triple(const char *fmt, const vec_t *values):
-    """Format three floats into the specified format string."""
-    cdef size_t size1, size2
-    cdef char *xbuf = NULL
-    cdef char *ybuf = NULL
-    cdef char *zbuf = NULL
-    cdef char *buf = NULL
     try:
-        xbuf = _format_float(values.x, 6)
-        ybuf = _format_float(values.y, 6)
-        zbuf = _format_float(values.z, 6)
-        size1 = snprintf(NULL, 0, fmt, xbuf, ybuf, zbuf)
-        buf = <char *>PyMem_Malloc(size1 + 1)
-        if buf == NULL:
-            raise MemoryError
-        size2 = snprintf(buf, size1 + 1, fmt, xbuf, ybuf, zbuf)
-        if size1 != size2:
-            raise SystemError('Could not format numbers!')
-        return buf[:size2].decode('ascii')
+        trim_size = calc_trim_float(buf, len(buf))
+        if trim_size == 0:  # String was '-0', write positive zero
+            PyUnicodeWriter_WriteChar(writer, '0')
+        else:
+            PyUnicodeWriter_WriteASCII(writer, buf, trim_size)
     finally:
-        PyMem_Free(xbuf)
-        PyMem_Free(ybuf)
-        PyMem_Free(zbuf)
         PyMem_Free(buf)
+    return 0
 
 
 cdef str _join_triple(const vec_t *values, str joiner):
     """Format three floats, with a delimiter."""
-    cdef size_t size1, size2
-    cdef char *xbuf = NULL
-    cdef char *ybuf = NULL
-    cdef char *zbuf = NULL
-    cdef char *buf = NULL
-    cdef const char *join_b = PyUnicode_AsUTF8AndSize(joiner, NULL)
+    cdef PyUnicodeWriter *writer = PyUnicodeWriter_Create(3 * (len(joiner) + 1))
     try:
-        xbuf = _format_float(values.x, 6)
-        ybuf = _format_float(values.y, 6)
-        zbuf = _format_float(values.z, 6)
-        size1 = snprintf(NULL, 0, b'%s%s%s%s%s', xbuf, join_b, ybuf, join_b, zbuf)
-        buf = <char *>PyMem_Malloc(size1 + 1)
-        if buf == NULL:
-            raise MemoryError
-        size2 = snprintf(buf, size1 + 1, b'%s%s%s%s%s', xbuf, join_b, ybuf, join_b, zbuf)
-        if size1 != size2:
-            raise SystemError('Could not format numbers!')
-        return buf[:size2].decode('utf8')
-    finally:
-        PyMem_Free(xbuf)
-        PyMem_Free(ybuf)
-        PyMem_Free(zbuf)
-        PyMem_Free(buf)
+        _write_float(writer, values.x, 6)
+        PyUnicodeWriter_WriteStr(writer, joiner)
+        _write_float(writer, values.y, 6)
+        PyUnicodeWriter_WriteStr(writer, joiner)
+        _write_float(writer, values.z, 6)
+
+        return PyUnicodeWriter_Finish(writer)
+    except:
+        PyUnicodeWriter_Discard(writer)
+        raise
 
 cdef object _format_vec_wspec(const vec_t *values, str spec):
     """Format a vector with the specified format spec."""
-    cdef str x_str, y_str, z_str
-    cdef const char *x_buf = NULL
-    cdef const char *y_buf = NULL
-    cdef const char *z_buf = NULL
-    cdef char *buf = NULL
-    cdef char *pos
-    cdef Py_ssize_t x_size, y_size, z_size, total
+    cdef str fmt_str
+    cdef const char *fmt_buf = NULL
+    cdef Py_ssize_t fmt_size, trim_size
+    cdef PyUnicodeWriter *writer
 
-    if not spec:
-        return _format_triple(b'%s %s %s', values)
-
-    x_str = format(values.x + 0.0, spec)
-    x_buf = PyUnicode_AsUTF8AndSize(x_str, &x_size)
-
-    y_str = format(values.y + 0.0, spec)
-    y_buf = PyUnicode_AsUTF8AndSize(y_str, &y_size)
-
-    z_str = format(values.z + 0.0, spec)
-    z_buf = PyUnicode_AsUTF8AndSize(z_str, &z_size)
-
-    # Allocate enough for worst-case (no rounding)
-    buf = <char *>PyMem_Malloc(x_size + y_size + z_size + 3)
+    writer = PyUnicodeWriter_Create(6)
     try:
-        # Pos = current position through the buffer.
-        # For each, copy in the number, then trim back excess zeros.
-        # We then overwrite that with the next part.
-        pos = buf
-        memcpy(pos, x_buf, x_size)
-        x_size = trim_float(pos, x_size)
-        pos += x_size + 1
-        pos[-1] = b' '
+        if not spec:
+            # Can bypass calling format().
+            _write_float(writer, values.x, 6)
+            PyUnicodeWriter_WriteChar(writer, ' ')
+            _write_float(writer, values.y, 6)
+            PyUnicodeWriter_WriteChar(writer, ' ')
+            _write_float(writer, values.z, 6)
+            return PyUnicodeWriter_Finish(writer)
 
-        memcpy(pos, y_buf, y_size)
-        y_size = trim_float(pos, y_size)
-        pos += y_size + 1
-        pos[-1] = b' '
+        # Otherwise we need Python-level format().
+        # Format into each string object, then convert to UTF-8. Calculate trim,
+        # then write truncating to there.
+        fmt_str = format(values.x + 0.0, spec)
+        fmt_buf = PyUnicode_AsUTF8AndSize(fmt_str, &fmt_size)
+        trim_size = calc_trim_float(fmt_buf, fmt_size)
+        if trim_size == 0:  # string was '-0', write positive zero.
+            PyUnicodeWriter_WriteChar(writer, '0')
+        else:
+            PyUnicodeWriter_WriteUTF8(writer, fmt_buf, trim_size)
 
-        memcpy(pos, z_buf, z_size)
-        z_size = trim_float(pos, z_size)
-        pos += z_size
-        pos[0] = 0
-        # return repr(buf[:pos - buf])
-        return buf[:pos-buf].decode('utf8')
-    finally:
-        PyMem_Free(buf)
+        PyUnicodeWriter_WriteChar(writer, ' ')
+
+        fmt_str = format(values.y + 0.0, spec)
+        fmt_buf = PyUnicode_AsUTF8AndSize(fmt_str, &fmt_size)
+        trim_size = calc_trim_float(fmt_buf, fmt_size)
+        if trim_size == 0:
+            PyUnicodeWriter_WriteChar(writer, '0')
+        else:
+            PyUnicodeWriter_WriteUTF8(writer, fmt_buf, trim_size)
+
+        PyUnicodeWriter_WriteChar(writer, ' ')
+
+        fmt_str = format(values.z + 0.0, spec)
+        fmt_buf = PyUnicode_AsUTF8AndSize(fmt_str, &fmt_size)
+        trim_size = calc_trim_float(fmt_buf, fmt_size)
+        if trim_size == 0:
+            PyUnicodeWriter_WriteChar(writer, '0')
+        else:
+            PyUnicodeWriter_WriteUTF8(writer, fmt_buf, trim_size)
+
+        return PyUnicodeWriter_Finish(writer)
+    except:
+        PyUnicodeWriter_Discard(writer)
+        raise
 
 
 cdef VecBase pick_vec_type(type left, type right):
@@ -280,7 +271,7 @@ cdef VecBase pick_vec_type(type left, type right):
 
 
 cdef AngleBase pick_ang_type(type left, type right):
-    # Given the LHS and RHS types, determine the Vec to create.
+    # Given the LHS and RHS types, determine the Angle to create.
     cdef bint frozen = False
     # We use the type of the left, falling back to the right
     # if the left isn't a angle.
@@ -290,15 +281,15 @@ cdef AngleBase pick_ang_type(type left, type right):
         return <AngleBase>Angle.__new__(Angle)
 
 
-cdef bint vec_check(obj) except -1:
+cdef bint vec_check(obj) noexcept:
     # Check if this is a vector instance.
     return type(obj) is Vec or type(obj) is FrozenVec
 
-cdef bint angle_check(obj) except -1:
+cdef bint angle_check(obj) noexcept:
     # Check if this is an angle instance.
     return type(obj) is Angle or type(obj) is FrozenAngle
 
-cdef bint mat_check(obj) except -1:
+cdef bint mat_check(obj) noexcept:
     # Check if this is a matrix instance.
     return type(obj) is Matrix or type(obj) is FrozenMatrix
 
@@ -311,13 +302,15 @@ cdef int _parse_vec_str(vec_t *vec, object value, double x, double y, double z) 
     cdef char c, end_delim = 0
 
     if vec_check(value):
-        vec.x = (<VecBase>value).val.x
-        vec.y = (<VecBase>value).val.y
-        vec.z = (<VecBase>value).val.z
+        with cython.critical_section(value):
+            vec.x = (<VecBase>value).val.x
+            vec.y = (<VecBase>value).val.y
+            vec.z = (<VecBase>value).val.z
     elif angle_check(value):
-        vec.x = (<AngleBase>value).val.x
-        vec.y = (<AngleBase>value).val.y
-        vec.z = (<AngleBase>value).val.z
+        with cython.critical_section(value):
+            vec.x = (<AngleBase>value).val.x
+            vec.y = (<AngleBase>value).val.y
+            vec.z = (<AngleBase>value).val.z
     elif isinstance(value, str):
         buf = PyUnicode_AsUTF8AndSize(value, &size)
         # First, skip through whitespace, and stop after the first
@@ -382,47 +375,48 @@ cdef object vector_compare(VecBase self, object other_obj, int op):
     except (TypeError, ValueError):
         return NotImplemented
 
-    # 'redundant' == True prevents the individual comparisons from trying
-    # to convert the result individually on failure.
+    # 'redundant' conditional expression prevents the individual
+    # comparisons from trying to convert the result individually on failure.
     # Use subtraction so that values within TOL are accepted.
-    if op == Py_EQ:
-        return (
-            abs(self.val.x - other.x) <= TOL and
-            abs(self.val.y - other.y) <= TOL and
-            abs(self.val.z - other.z) <= TOL
-        ) == True
-    elif op == Py_NE:
-        return (
-            abs(self.val.x - other.x) > TOL or
-            abs(self.val.y - other.y) > TOL or
-            abs(self.val.z - other.z) > TOL
-        ) == True
-    elif op == Py_LT:
-        return (
-            (other.x - self.val.x) > TOL and
-            (other.y - self.val.y) > TOL and
-            (other.z - self.val.z) > TOL
-        ) == True
-    elif op == Py_GT:
-        return (
-            (self.val.x - other.x) > TOL and
-            (self.val.y - other.y) > TOL and
-            (self.val.z - other.z) > TOL
-        ) == True
-    elif op == Py_LE:  # !GT
-        return (
-            (self.val.x - other.x) <= TOL and
-            (self.val.y - other.y) <= TOL and
-            (self.val.z - other.z) <= TOL
-        ) == True
-    elif op == Py_GE: # !LT
-        return (
-            (other.x - self.val.x) <= TOL and
-            (other.y - self.val.y) <= TOL and
-            (other.z - self.val.z) <= TOL
-        ) == True
-    else:
-        raise SystemError('Unknown operation', op)
+    with cython.critical_section(self):
+        if op == Py_EQ:
+            return True if (
+                abs(self.val.x - other.x) <= TOL and
+                abs(self.val.y - other.y) <= TOL and
+                abs(self.val.z - other.z) <= TOL
+            ) else False
+        elif op == Py_NE:
+            return (
+                abs(self.val.x - other.x) > TOL or
+                abs(self.val.y - other.y) > TOL or
+                abs(self.val.z - other.z) > TOL
+            ) == True
+        elif op == Py_LT:
+            return True if (
+                (other.x - self.val.x) > TOL and
+                (other.y - self.val.y) > TOL and
+                (other.z - self.val.z) > TOL
+            ) else False
+        elif op == Py_GT:
+            return True if (
+                (self.val.x - other.x) > TOL and
+                (self.val.y - other.y) > TOL and
+                (self.val.z - other.z) > TOL
+            ) else False
+        elif op == Py_LE:  # !GT
+            return True if (
+                (self.val.x - other.x) <= TOL and
+                (self.val.y - other.y) <= TOL and
+                (self.val.z - other.z) <= TOL
+            ) else False
+        elif op == Py_GE: # !LT
+            return True if (
+                (other.x - self.val.x) <= TOL and
+                (other.y - self.val.y) <= TOL and
+                (other.z - self.val.z) <= TOL
+            ) else False
+        else:
+            raise SystemError('Unknown operation', op)
 
 # Shared among both classes.
 cdef object angle_compare(AngleBase self, object other_obj, int op):
@@ -436,28 +430,29 @@ cdef object angle_compare(AngleBase self, object other_obj, int op):
     # trying
     # to convert the result individually on failure.
     # Use subtraction so that values within TOL are accepted.
-    if op == Py_EQ:
-        return (
-                   abs(self.val.x - other.x) <= TOL and
-                   abs(self.val.y - other.y) <= TOL and
-                   abs(self.val.z - other.z) <= TOL
-               ) == True
-    elif op == Py_NE:
-        return (
-                   abs(self.val.x - other.x) > TOL or
-                   abs(self.val.y - other.y) > TOL or
-                   abs(self.val.z - other.z) > TOL
-               ) == True
-    elif op in [Py_LT, Py_GT, Py_GE, Py_LE]:
-        return NotImplemented
-    else:
-        raise SystemError(f'Unknown operation {op!r}' '!')
+    with cython.critical_section(self):
+        if op == Py_EQ:
+            return (
+                       abs(self.val.x - other.x) <= TOL and
+                       abs(self.val.y - other.y) <= TOL and
+                       abs(self.val.z - other.z) <= TOL
+                   ) == True
+        elif op == Py_NE:
+            return (
+                       abs(self.val.x - other.x) > TOL or
+                       abs(self.val.y - other.y) > TOL or
+                       abs(self.val.z - other.z) > TOL
+                   ) == True
+        elif op in [Py_LT, Py_GT, Py_GE, Py_LE]:
+            return NotImplemented
+        else:
+            raise SystemError(f'Unknown operation {op!r}' '!')
 
 
 def parse_vec_str(object val, object x=0.0, object y=0.0, object z=0.0):
     """Convert a string in the form '(4 6 -4)' into a set of floats.
 
-    If the string is unparsable, this uses the defaults (x,y,z).
+    If the string is unparsable, this uses the defaults (x,y,z) (which don't have to be floats).
     The string can be surrounded with any of the (), {}, [], <> bracket
     types.
 
@@ -483,12 +478,13 @@ def lerp(x: float, in_min: float, in_max: float, out_min: float, out_max: float)
 
 def format_float(x: float, places: int=6) -> str:
     """Convert the specified float to a string, stripping off a .0 if it ends with that."""
-    buf = _format_float(x, places)
+    cdef PyUnicodeWriter *writer = PyUnicodeWriter_Create(0)
     try:
-        return buf.decode('ascii')
-    finally:
-        PyMem_Free(buf)
-
+        _write_float(writer, x, places)
+        return PyUnicodeWriter_Finish(writer)
+    except:
+        PyUnicodeWriter_Discard(writer)
+        raise
 
 
 cdef inline bint conv_vec(
@@ -501,10 +497,11 @@ cdef inline bint conv_vec(
     If scalar is True, allow int/float to set all axes.
     """
     if vec_check(vec):
-        result.x = (<VecBase>vec).val.x
-        result.y = (<VecBase>vec).val.y
-        result.z = (<VecBase>vec).val.z
-    elif isinstance(vec, float) or isinstance(vec, int):
+        with cython.critical_section(vec):
+            result.x = (<VecBase>vec).val.x
+            result.y = (<VecBase>vec).val.y
+            result.z = (<VecBase>vec).val.z
+    elif isinstance(vec, float | int):
         if scalar:
             result.x = result.y = result.z = vec
         else:
@@ -528,10 +525,11 @@ cdef inline bint conv_angles(vec_t *result, object ang) except False:
     """
     cdef double x, y, z
     if angle_check(ang):
-        result.x = (<AngleBase>ang).val.x
-        result.y = (<AngleBase>ang).val.y
-        result.z = (<AngleBase>ang).val.z
-    elif isinstance(ang, float) or isinstance(ang, int):
+        with cython.critical_section(ang):
+            result.x = (<AngleBase>ang).val.x
+            result.y = (<AngleBase>ang).val.y
+            result.z = (<AngleBase>ang).val.z
+    elif isinstance(ang, float | int):
         raise TypeError('Cannot convert scalars to an Angle!')
     elif isinstance(ang, tuple):
         x, y, z = <tuple>ang
@@ -554,7 +552,7 @@ cdef inline double _vec_mag_sq(vec_t *vec) noexcept nogil:
 cdef inline double _vec_mag(vec_t *vec) noexcept nogil:
     return math.sqrt(_vec_mag_sq(vec))
 
-cdef inline double _vec_normalise(vec_t *out, vec_t *inp) except -1.0:
+cdef inline double _vec_normalise(vec_t *out, vec_t *inp) noexcept nogil:
     """Normalise the vector, writing to out. inp and out may be the same."""
     cdef double mag = _vec_mag(inp)
 
@@ -570,7 +568,18 @@ cdef inline double _vec_normalise(vec_t *out, vec_t *inp) except -1.0:
     return mag
 
 
+# Reserve ability to raise exceptions in the future.
 cdef inline bint mat_mul(mat_t targ, mat_t rot) except False:
+    """Rotate target by the rotator matrix."""
+    _mat_mul(targ, rot)
+
+
+cdef inline bint vec_rot(vec_t *vec, mat_t mat) except False:
+    """Rotate a vector by our value."""
+    _vec_rot(vec, mat)
+
+
+cdef inline void _mat_mul(mat_t targ, mat_t rot) noexcept nogil:
     """Rotate target by the rotator matrix."""
     cdef double a, b, c
     cdef int i
@@ -583,10 +592,9 @@ cdef inline bint mat_mul(mat_t targ, mat_t rot) except False:
         targ[i][0] = a * rot[0][0] + b * rot[1][0] + c * rot[2][0]
         targ[i][1] = a * rot[0][1] + b * rot[1][1] + c * rot[2][1]
         targ[i][2] = a * rot[0][2] + b * rot[1][2] + c * rot[2][2]
-    return True
 
 
-cdef inline bint vec_rot(vec_t *vec, mat_t mat) except False:
+cdef inline void _vec_rot(vec_t *vec, mat_t mat) noexcept nogil:
     """Rotate a vector by our value."""
     cdef double x = vec.x
     cdef double y = vec.y
@@ -594,18 +602,16 @@ cdef inline bint vec_rot(vec_t *vec, mat_t mat) except False:
     vec.x = (x * mat[0][0]) + (y * mat[1][0]) + (z * mat[2][0])
     vec.y = (x * mat[0][1]) + (y * mat[1][1]) + (z * mat[2][1])
     vec.z = (x * mat[0][2]) + (y * mat[1][2]) + (z * mat[2][2])
-    return True
 
 
-cdef inline bint _vec_cross(vec_t *res, vec_t *a, vec_t *b) except False:
+cdef inline void _vec_cross(vec_t *res, vec_t *a, vec_t *b) noexcept nogil:
     """Compute the cross product of A x B. """
     res.x = a.y * b.z - a.z * b.y
     res.y = a.z * b.x - a.x * b.z
     res.z = a.x * b.y - a.y * b.x
-    return True
 
 
-cdef bint _mat_from_angle(mat_t res, vec_t *angle) except False:
+cdef void _mat_from_angle(mat_t res, vec_t *angle) noexcept nogil:
     cdef double p = deg_2_rad(angle.x)
     cdef double y = deg_2_rad(angle.y)
     cdef double r = deg_2_rad(angle.z)
@@ -621,11 +627,10 @@ cdef bint _mat_from_angle(mat_t res, vec_t *angle) except False:
     res[2][0] = sin(p) * cos(r) * cos(y) + sin(r) * sin(y)
     res[2][1] = sin(p) * cos(r) * sin(y) - sin(r) * cos(y)
     res[2][2] = cos(r) * cos(p)
-    return True
 
 
-cdef inline bint _mat_to_angle(vec_t *ang, mat_t mat) except False:
-    # https://github.com/ValveSoftware/source-sdk-2013/blob/master/sp/src/mathlib/mathlib_base.cpp#L208
+cdef inline void _mat_to_angle(vec_t *ang, mat_t mat) noexcept nogil:
+    # https://github.com/ValveSoftware/source-sdk-2013/blob/0d8dceea4310fde5706b3ce1c70609d72a38efdf/sp/src/mathlib/mathlib_base.cpp#L208
     cdef double horiz_dist = math.sqrt(mat[0][0]**2 + mat[0][1]**2)
     if horiz_dist > 0.001:
         ang.x = norm_ang(rad_2_deg(math.atan2(-mat[0][2], horiz_dist)))
@@ -636,7 +641,6 @@ cdef inline bint _mat_to_angle(vec_t *ang, mat_t mat) except False:
         ang.x = norm_ang(rad_2_deg(math.atan2(-mat[0][2], horiz_dist)))
         ang.y = norm_ang(rad_2_deg(math.atan2(-mat[1][0], mat[1][1])))
         ang.z = 0.0  # Can't produce.
-    return True
 
 
 cdef bint _mat_from_basis(mat_t mat, VecBase x, VecBase y, VecBase z) except False:
@@ -645,13 +649,19 @@ cdef bint _mat_from_basis(mat_t mat, VecBase x, VecBase y, VecBase z) except Fal
     vec_x = vec_y = vec_z = {'x': NAN, 'y': NAN, 'z': NAN}
 
     if x is not None:
-        if _vec_normalise(&vec_x, &x.val) < 1e-6:
+        with cython.critical_section(x):
+            vec_x = x.val
+        if _vec_normalise(&vec_x, &vec_x) < 1e-6:
             raise ValueError('Basis vectors must be non-zero!')
     if y is not None:
-        if _vec_normalise(&vec_y, &y.val) < 1e-6:
+        with cython.critical_section(y):
+            vec_y = y.val
+        if _vec_normalise(&vec_y, &vec_y) < 1e-6:
             raise ValueError('Basis vectors must be non-zero!')
     if z is not None:
-        if _vec_normalise(&vec_z, &z.val) < 1e-6:
+        with cython.critical_section(z):
+            vec_z = z.val
+        if _vec_normalise(&vec_z, &vec_z) < 1e-6:
             raise ValueError('Basis vectors must be non-zero!')
 
     if x is not None:
@@ -714,16 +724,15 @@ cdef bint _mat_from_basis(mat_t mat, VecBase x, VecBase y, VecBase z) except Fal
     return True
 
 
-cdef inline bint _mat_identity(mat_t matrix) except False:
+cdef inline void _mat_identity(mat_t matrix) noexcept nogil:
     """Set the matrix to the identity transform."""
     memset(matrix, 0, sizeof(mat_t))
     matrix[0][0] = 1.0
     matrix[1][1] = 1.0
     matrix[2][2] = 1.0
-    return True
 
 
-cdef bint _conv_matrix(mat_t result, object value) except False:
+cdef void _conv_matrix(mat_t result, object value) noexcept:
     """Convert various values to a rotation matrix.
 
     Vectors will be treated as angles, and None as the identity.
@@ -732,15 +741,17 @@ cdef bint _conv_matrix(mat_t result, object value) except False:
     if value is None:
         _mat_identity(result)
     elif mat_check(value):
-        memcpy(result, (<MatrixBase>value).mat, sizeof(mat_t))
+        with cython.critical_section(value):
+            memcpy(result, (<MatrixBase>value).mat, sizeof(mat_t))
     elif angle_check(value):
-        _mat_from_angle(result, &(<AngleBase>value).val)
+        with cython.critical_section(value):
+            _mat_from_angle(result, &(<AngleBase>value).val)
     elif vec_check(value):
-        _mat_from_angle(result, &(<VecBase>value).val)
+        with cython.critical_section(value):
+            _mat_from_angle(result, &(<VecBase>value).val)
     else:
         [ang.x, ang.y, ang.z] = value
         _mat_from_angle(result, &ang)
-    return True
 
 
 def to_matrix(value) -> Matrix:
@@ -752,7 +763,7 @@ def to_matrix(value) -> Matrix:
     _conv_matrix(result.mat, value)
     return result
 
-# These are functions, so that they can ba accessed both bound and unbound.
+# These are functions, so that they can be accessed both bound and unbound.
 def cross_frozenvec(left, right):
     """Return the cross product of both Vectors."""
     cdef vec_t a, b
@@ -881,7 +892,7 @@ cdef class VecIter:
         return self
 
     def __next__(self) -> float:
-        if self.index == 3:
+        if self.index >= 3:
             raise StopIteration
         self.index += 1
         if self.index == 1:
@@ -890,6 +901,7 @@ cdef class VecIter:
             return self.b
         elif self.index == 3:
             return self.c
+        raise AssertionError(f"Invalid index: {self.index!r}")
 
 
 @cython.final
@@ -998,7 +1010,8 @@ cdef class VecTransform:
             exc_val is None and
             exc_tb is None
         ):
-            vec_rot(&self.vec.val, self.mat.mat)
+            with cython.critical_section(self.vec, self.mat):
+                _vec_rot(&self.vec.val, self.mat.mat)
         return False
 
 
@@ -1025,7 +1038,8 @@ cdef class AngleTransform:
             exc_val is None and
             exc_tb is None
         ):
-            _mat_to_angle(&self.ang.val, self.mat.mat)
+            with cython.critical_section(self.ang, self.mat):
+                _mat_to_angle(&self.ang.val, self.mat.mat)
         return False
 
 
@@ -1038,8 +1052,7 @@ cdef class VecBase:
     __match_args__ = ('x', 'y', 'z')
     __hash__ = None
 
-    # Various constants.
-    INV_AXIS = {
+    INV_AXIS = MappingProxyType({
         'x': ('y', 'z'),
         'y': ('x', 'z'),
         'z': ('x', 'y'),
@@ -1051,7 +1064,7 @@ cdef class VecBase:
         ('z', 'y'): 'x',
         ('z', 'x'): 'y',
         ('y', 'x'): 'z',
-    }
+    })
 
     # Vectors pointing in all cardinal directions.
     N = north = y_pos = _vector_frozen(0, 1, 0)
@@ -1061,7 +1074,8 @@ cdef class VecBase:
     T = top = z_pos = _vector_frozen(0, 0, 1)
     B = bottom = z_neg = _vector_frozen(0, 0, -1)
 
-    def __init__(self, x=0.0, y=0.0, z=0.0) -> None:
+    @cython.critical_section
+    def __init__(self, x=0.0, y: float = 0.0, z: float = 0.0) -> None:
         """Create a Vector.
 
         All values are converted to Floats automatically.
@@ -1074,14 +1088,15 @@ cdef class VecBase:
         if type(self) is VecBase:
             raise TypeError('This class cannot be instantiated!')
 
-        if isinstance(x, float) or isinstance(x, int):
+        if isinstance(x, float | int):
             self.val.x = x
             self.val.y = y
             self.val.z = z
         elif vec_check(x):
-            self.val.x = (<VecBase>x).val.x
-            self.val.y = (<VecBase>x).val.y
-            self.val.z = (<VecBase>x).val.z
+            with cython.critical_section(x):
+                self.val.x = (<VecBase>x).val.x
+                self.val.y = (<VecBase>x).val.y
+                self.val.z = (<VecBase>x).val.z
         elif isinstance(x, tuple):
             tup = <tuple>x
             if len(tup) >= 1:
@@ -1165,24 +1180,27 @@ cdef class VecBase:
             if isinstance(axis_obj, str) and len(<str>axis_obj) == 1:
                 axis = (<str>axis_obj)[0]
             else:
-                raise KeyError(f'Invalid axis {axis_obj!r}' '!')
+                raise KeyError(f'Invalid axis: {axis_obj!r}')
             if axis == 'x':
                 if vec_check(axis_val):
-                    vec.val.x = (<VecBase>axis_val).val.x
+                    with cython.critical_section(axis_val):
+                        vec.val.x = (<VecBase>axis_val).val.x
                 else:
                     vec.val.x = axis_val
             elif axis == 'y':
                 if vec_check(axis_val):
-                    vec.val.y = (<VecBase>axis_val).val.y
+                    with cython.critical_section(axis_val):
+                        vec.val.y = (<VecBase>axis_val).val.y
                 else:
                     vec.val.y = axis_val
             elif axis == 'z':
                 if vec_check(axis_val):
-                    vec.val.z = (<VecBase>axis_val).val.z
+                    with cython.critical_section(axis_val):
+                        vec.val.z = (<VecBase>axis_val).val.z
                 else:
                     vec.val.z = axis_val
             else:
-                raise KeyError(f'Invalid axis {axis_obj!r}' '!')
+                raise KeyError(f'Invalid axis: {axis_obj!r}')
 
         return vec
 
@@ -1205,42 +1223,43 @@ cdef class VecBase:
             if vec_check(points[0]):
                 # Special case, don't iter over the vec, just copy.
                 sing_vec = <VecBase>points[0]
-                bbox_min.val = sing_vec.val
-                bbox_max.val = sing_vec.val
-                return bbox_min, bbox_max
+                with cython.critical_section(sing_vec):
+                    bbox_min.val = sing_vec.val
+                    bbox_max.val = sing_vec.val
+                    return bbox_min, bbox_max
             points_iter = iter(points[0])
             try:
                 first = next(points_iter)
             except StopIteration:
-                raise ValueError('Empty iterator!') from None
+                raise ValueError('Vec.bbox() arg is an empty sequence') from None
 
             conv_vec(&bbox_min.val, first, scalar=False)
             bbox_max.val = bbox_min.val
 
-            try:
-                while True:
+            while True:
+                try:
                     point = next(points_iter)
-                    conv_vec(&vec, point, scalar=False)
+                except StopIteration:
+                    break
+                conv_vec(&vec, point, scalar=False)
 
-                    if bbox_max.val.x < vec.x:
-                        bbox_max.val.x = vec.x
+                if bbox_max.val.x < vec.x:
+                    bbox_max.val.x = vec.x
 
-                    if bbox_max.val.y < vec.y:
-                        bbox_max.val.y = vec.y
+                if bbox_max.val.y < vec.y:
+                    bbox_max.val.y = vec.y
 
-                    if bbox_max.val.z < vec.z:
-                        bbox_max.val.z = vec.z
+                if bbox_max.val.z < vec.z:
+                    bbox_max.val.z = vec.z
 
-                    if bbox_min.val.x > vec.x:
-                        bbox_min.val.x = vec.x
+                if bbox_min.val.x > vec.x:
+                    bbox_min.val.x = vec.x
 
-                    if bbox_min.val.y > vec.y:
-                        bbox_min.val.y = vec.y
+                if bbox_min.val.y > vec.y:
+                    bbox_min.val.y = vec.y
 
-                    if bbox_min.val.z > vec.z:
-                        bbox_min.val.z = vec.z
-            except StopIteration:
-                pass
+                if bbox_min.val.z > vec.z:
+                    bbox_min.val.z = vec.z
         elif len(points) == 0:
             raise TypeError(
                 'Vec.bbox() expected at '
@@ -1279,10 +1298,10 @@ cdef class VecBase:
     @classmethod
     def iter_grid(
         cls,
-        object min_pos: typing.Union[Vec, typing.Tuple[int, int, int]],
-        object max_pos: typing.Union[Vec, typing.Tuple[int, int, int]],
+        object min_pos: Union[Vec, tuple[int, int, int]],
+        object max_pos: Union[Vec, tuple[int, int, int]],
         stride: int = 1,
-    ) -> typing.Iterator[Vec]:
+    ) -> Iterator[Vec]:
         """Loop over points in a bounding box. All coordinates should be integers.
 
         Both borders will be included.
@@ -1309,7 +1328,7 @@ cdef class VecBase:
 
         return it
 
-    def iter_line(self, end: VecBase, stride: int=1) -> typing.Iterator[Vec]:
+    def iter_line(self, end: VecBase, stride: int=1) -> Iterator[Vec]:
         """Yield points between this point and 'end' (including both endpoints).
 
         Stride specifies the distance between each point.
@@ -1320,15 +1339,17 @@ cdef class VecBase:
         cdef double length
         cdef double pos
         cdef VecIterLine it = VecIterLine.__new__(VecIterLine)
-        offset.x = end.val.x - self.val.x
-        offset.y = end.val.y - self.val.y
-        offset.z = end.val.z - self.val.z
+        with cython.critical_section(end):
+            offset.x = end.val.x - self.val.x
+            offset.y = end.val.y - self.val.y
+            offset.z = end.val.z - self.val.z
+            it.end = end.val
+        with cython.critical_section(self):
+            it.start = self.val
 
         length = _vec_mag(&offset)
         _vec_normalise(&it.diff, &offset)
 
-        it.start = self.val
-        it.end = end.val
         it.cur_off = 0
         it.max = llround(length)
         it.stride = int(stride)
@@ -1345,13 +1366,18 @@ cdef class VecBase:
         """
         cdef double diff = in_max - in_min
         cdef double off = x - in_min
+        cdef vec_t min_val, max_val
         if diff == 0.0:
             raise ZeroDivisionError('In values must not be equal!')
+        with cython.critical_section(out_min):
+            min_val = out_min.val
+        with cython.critical_section(out_max):
+            max_val = out_max.val
         return _vector(
             cls,
-            out_min.val.x + (off * (out_max.val.x - out_min.val.x)) / diff,
-            out_min.val.y + (off * (out_max.val.y - out_min.val.y)) / diff,
-            out_min.val.z + (off * (out_max.val.z - out_min.val.z)) / diff,
+            min_val.x + (off * (max_val.x - min_val.x)) / diff,
+            min_val.y + (off * (max_val.y - min_val.y)) / diff,
+            min_val.z + (off * (max_val.z - min_val.z)) / diff,
         )
 
     def clamped(self, *args, mins = None, maxs = None):
@@ -1396,9 +1422,11 @@ cdef class VecBase:
                 conv_vec(&vec_max, maxs, scalar=False)
                 has_maxs = True
 
-        cdef double x = self.val.x
-        cdef double y = self.val.y
-        cdef double z = self.val.z
+        cdef double x, y, z
+        with cython.critical_section(self):
+            x = self.val.x
+            y = self.val.y
+            z = self.val.z
         cdef bint return_self = type(self) is FrozenVec
         if has_mins:
             if x < vec_min.x:
@@ -1430,9 +1458,10 @@ cdef class VecBase:
         """For a normal vector, return the axis it is on."""
         cdef bint x, y, z
         # Treat extremely close to zero as zero.
-        x = abs(self.val.x) > TOL
-        y = abs(self.val.y) > TOL
-        z = abs(self.val.z) > TOL
+        with cython.critical_section(self):
+            x = abs(self.val.x) > TOL
+            y = abs(self.val.y) > TOL
+            z = abs(self.val.z) > TOL
         if x and not y and not z:
             return 'x'
         if not x and y and not z:
@@ -1445,21 +1474,23 @@ cdef class VecBase:
         )
 
     @cython.boundscheck(False)
-    def other_axes(self, object axis) -> typing.Tuple[float, float]:
+    def other_axes(self, object axis) -> tuple[float, float]:
         """Get the values for the other two axes."""
         cdef char axis_chr
         if isinstance(axis, str) and len(<str>axis) == 1:
             axis_chr = (<str>axis)[0]
         else:
-            raise KeyError(f'Invalid axis {axis!r}' '!')
+            raise KeyError(f'Invalid axis: {axis!r}')
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
         if axis_chr == b'x':
-            return self.val.y, self.val.z
+            return self_val.y, self_val.z
         elif axis_chr == b'y':
-            return self.val.x, self.val.z
+            return self_val.x, self_val.z
         elif axis_chr == b'z':
-            return self.val.x, self.val.y
-        else:
-            raise KeyError(f'Invalid axis {axis!r}' '!')
+            return self_val.x, self_val.y
+        raise KeyError(f'Invalid axis: {axis!r}')
 
     def in_bbox(self, a, b):
         """Check if this point is inside the specified bounding box."""
@@ -1473,26 +1504,42 @@ cdef class VecBase:
         if avec.z > bvec.z:
             avec.z, bvec.z = bvec.z, avec.z
 
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
         return (
-            avec.x - TOL <= self.val.x <= bvec.x + TOL and
-            avec.y - TOL <= self.val.y <= bvec.y + TOL and
-            avec.z - TOL <= self.val.z <= bvec.z + TOL
+            avec.x - TOL <= self_val.x <= bvec.x + TOL and
+            avec.y - TOL <= self_val.y <= bvec.y + TOL and
+            avec.z - TOL <= self_val.z <= bvec.z + TOL
         )  == True
 
     @staticmethod
     def bbox_intersect(min1: VecBase, max1: VecBase, min2: VecBase, max2: VecBase) -> bool:
         """Check if the (min1, max1) bbox intersects the (min2, max2) bbox."""
+        cdef vec_t min_a, min_b, max_a, max_b
+        with cython.critical_section(min1):
+            min_a = min1.val
+        with cython.critical_section(min2):
+            min_b = min2.val
+        with cython.critical_section(max1):
+            max_a = max1.val
+        with cython.critical_section(max2):
+            max_b = max2.val
         return not (
-            (min2.val.x - max1.val.x) > TOL or (min1.val.x - max2.val.x) > TOL or
-            (min2.val.y - max1.val.y) > TOL or (min1.val.y - max2.val.y) > TOL or
-            (min2.val.z - max1.val.z) > TOL or (min1.val.z - max2.val.z) > TOL
+            (min_b.x - max_a.x) > TOL or (min_a.x - max_b.x) > TOL or
+            (min_b.y - max_a.y) > TOL or (min_a.y - max_b.y) > TOL or
+            (min_b.z - max_a.z) > TOL or (min_a.z - max_b.z) > TOL
         )
 
-    def as_tuple(self) -> typing.Tuple[float, float, float]:
+    def as_tuple(self) -> tuple[float, float, float]:
         """Return the Vector as a tuple."""
         PyErr_WarnEx(DeprecationWarning, 'Vec_tuple is deprecated, use FrozenVec instead.', 1)
-        return _make_tuple(round(self.val.x, ROUND_TO), round(self.val.y, ROUND_TO), round(self.val.z, ROUND_TO))
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _make_tuple(round(self_val.x, ROUND_TO), round(self_val.y, ROUND_TO), round(self_val.z, ROUND_TO))
 
+    @cython.critical_section
     def to_angle(self, double roll: float=0):
         """Convert a normal to a Source Engine angle.
 
@@ -1510,14 +1557,17 @@ cdef class VecBase:
             norm_ang(roll),
         )
 
+    @cython.critical_section
     def __abs__(self):
         """Performing abs() on a Vec takes the absolute value of all axes."""
         return _vector(type(self), abs(self.val.x), abs(self.val.y), abs(self.val.z))
 
+    @cython.critical_section
     def __neg__(self):
         """The inverted form of a Vector has inverted axes."""
         return _vector(type(self),  -self.val.x, -self.val.y, -self.val.z)
 
+    @cython.critical_section
     def __pos__(self):
         """+ on a Vector simply copies it."""
         return _vector(type(self), self.val.x, self.val.y, self.val.z)
@@ -1529,12 +1579,13 @@ cdef class VecBase:
             val_d = val
         except (TypeError, ValueError): # Non-floats should return False!
             return False
-        if val_d == self.val.x:
-            return True
-        if val_d == self.val.y:
-            return True
-        if val_d == self.val.z:
-            return True
+        with cython.critical_section(self):
+            if val_d == self.val.x:
+                return True
+            if val_d == self.val.y:
+                return True
+            if val_d == self.val.z:
+                return True
         return False
 
     # Non-in-place operators. Arg 1 may not be a Vec.
@@ -1582,7 +1633,7 @@ cdef class VecBase:
         cdef VecBase vec
         cdef double scalar
         # Vector * Vector is disallowed.
-        if isinstance(obj_a, (int, float)):
+        if isinstance(obj_a, int | float):
             # scalar * vector
             if type(obj_b) is Vec:
                 vec = Vec.__new__(Vec)
@@ -1595,7 +1646,7 @@ cdef class VecBase:
             vec.val.x = scalar * vec.val.x
             vec.val.y = scalar * vec.val.y
             vec.val.z = scalar * vec.val.z
-        elif isinstance(obj_b, (int, float)):
+        elif isinstance(obj_b, int | float):
             # vector * scalar.
             if type(obj_a) is Vec:
                 vec = Vec.__new__(Vec)
@@ -1622,7 +1673,7 @@ cdef class VecBase:
         cdef VecBase vec
         cdef double scalar
         # Vector / Vector is disallowed.
-        if isinstance(obj_a, (int, float)):
+        if isinstance(obj_a, int | float):
             # scalar / vector
             if type(obj_b) is Vec:
                 vec = Vec.__new__(Vec)
@@ -1635,7 +1686,7 @@ cdef class VecBase:
             vec.val.x = scalar / vec.val.x
             vec.val.y = scalar / vec.val.y
             vec.val.z = scalar / vec.val.z
-        elif isinstance(obj_b, (int, float)):
+        elif isinstance(obj_b, int | float):
             # vector / scalar.
             if type(obj_a) is Vec:
                 vec = Vec.__new__(Vec)
@@ -1661,7 +1712,7 @@ cdef class VecBase:
         cdef VecBase vec
         cdef double scalar
         # Vector // Vector is disallowed.
-        if isinstance(obj_a, (int, float)):
+        if isinstance(obj_a, int | float):
             # scalar // vector
             if type(obj_b) is Vec:
                 vec = Vec.__new__(Vec)
@@ -1674,7 +1725,7 @@ cdef class VecBase:
             vec.val.x = scalar // vec.val.x
             vec.val.y = scalar // vec.val.y
             vec.val.z = scalar // vec.val.z
-        elif isinstance(obj_b, (int, float)):
+        elif isinstance(obj_b, int | float):
             # vector // scalar.
             if type(obj_a) is Vec:
                 vec = Vec.__new__(Vec)
@@ -1700,7 +1751,7 @@ cdef class VecBase:
         cdef VecBase vec
         cdef double scalar
         # Vector % Vector is disallowed.
-        if isinstance(obj_a, (int, float)):
+        if isinstance(obj_a, int | float):
             # scalar % vector
             if type(obj_b) is Vec:
                 vec = Vec.__new__(Vec)
@@ -1714,7 +1765,7 @@ cdef class VecBase:
             vec.val.y = scalar % vec.val.y
             vec.val.z = scalar % vec.val.z
             return vec
-        elif isinstance(obj_b, (int, float)):
+        elif isinstance(obj_b, int | float):
             # vector % scalar.
             if type(obj_a) is Vec:
                 vec = Vec.__new__(Vec)
@@ -1740,18 +1791,22 @@ cdef class VecBase:
         cdef VecBase res
         if type(first) is Vec:
             res = Vec.__new__(Vec)
-            res.val = (<Vec>first).val
+            with cython.critical_section(first):
+                res.val = (<Vec>first).val
         elif type(first) is FrozenVec:
             res = FrozenVec.__new__(FrozenVec)
+            # Can't mutate, so should be safe.
             res.val = (<FrozenVec>first).val
         else:
             return NotImplemented
 
         if angle_check(second):
-            _mat_from_angle(temp, &(<AngleBase>second).val)
-            vec_rot(&res.val, temp)
+            with cython.critical_section(second):
+                _mat_from_angle(temp, &(<AngleBase>second).val)
+            _vec_rot(&res.val, temp)
         elif mat_check(second):
-            vec_rot(&res.val, (<MatrixBase>second).mat)
+            with cython.critical_section(second):
+                _vec_rot(&res.val, (<MatrixBase>second).mat)
         else:
             return NotImplemented
 
@@ -1759,7 +1814,7 @@ cdef class VecBase:
 
     def __divmod__(obj_a, obj_b):
         """Divide the vector by a scalar, returning the result and remainder."""
-        cdef VecBase vec
+        cdef vec_t vec
         cdef VecBase res_1
         cdef VecBase res_2
         cdef double other_d
@@ -1768,7 +1823,8 @@ cdef class VecBase:
             if vec_check(obj_b):
                 raise TypeError("Cannot divide 2 Vectors.")
             # vec / val
-            vec = <VecBase>obj_a
+            with cython.critical_section(obj_a):
+                vec = (<VecBase>obj_a).val
             try:
                 other_d = <double ?>obj_b
             except TypeError:
@@ -1782,15 +1838,16 @@ cdef class VecBase:
                 res_2 = <VecBase>FrozenVec.__new__(FrozenVec)
 
             # We put % first, since Cython then produces a 'divmod' error.
-            res_2.val.x = vec.val.x % other_d
-            res_1.val.x = vec.val.x // other_d
-            res_2.val.y = vec.val.y % other_d
-            res_1.val.y = vec.val.y // other_d
-            res_2.val.z = vec.val.z % other_d
-            res_1.val.z = vec.val.z // other_d
+            res_2.val.x = vec.x % other_d
+            res_1.val.x = vec.x // other_d
+            res_2.val.y = vec.y % other_d
+            res_1.val.y = vec.y // other_d
+            res_2.val.z = vec.z % other_d
+            res_1.val.z = vec.z // other_d
         elif vec_check(obj_b):
             # val / vec
-            vec = <VecBase>obj_b
+            with cython.critical_section(obj_b):
+                vec = (<VecBase>obj_b).val
             try:
                 other_d = <double ?>obj_a
             except TypeError:
@@ -1803,12 +1860,12 @@ cdef class VecBase:
                 res_1 = <VecBase>FrozenVec.__new__(FrozenVec)
                 res_2 = <VecBase>FrozenVec.__new__(FrozenVec)
 
-            res_2.val.x = other_d % vec.val.x
-            res_1.val.x = other_d // vec.val.x
-            res_2.val.y = other_d % vec.val.y
-            res_1.val.y = other_d // vec.val.y
-            res_2.val.z = other_d % vec.val.z
-            res_1.val.z = other_d // vec.val.z
+            res_2.val.x = other_d % vec.x
+            res_1.val.x = other_d // vec.x
+            res_2.val.y = other_d % vec.y
+            res_1.val.y = other_d // vec.y
+            res_2.val.z = other_d % vec.z
+            res_1.val.z = other_d // vec.z
         else:
             return NotImplemented
 
@@ -1816,13 +1873,14 @@ cdef class VecBase:
 
     def __bool__(self) -> bool:
         """Vectors are True if any axis is non-zero."""
-        if self.val.x != 0:
-            return True
-        if self.val.y != 0:
-            return True
-        if self.val.z != 0:
-            return True
-        return False
+        with cython.critical_section(self):
+            if self.val.x != 0:
+                return True
+            if self.val.y != 0:
+                return True
+            if self.val.z != 0:
+                return True
+            return False
 
     def __len__(self):
         """The len() of a vector is always 3."""
@@ -1830,19 +1888,23 @@ cdef class VecBase:
 
     def mag_sq(self):
         """Compute the distance from the vector and the origin."""
-        return _vec_mag_sq(&self.val)
+        with cython.critical_section(self):
+            return _vec_mag_sq(&self.val)
 
     def len_sq(self):
         """Compute the distance from the vector and the origin."""
-        return _vec_mag_sq(&self.val)
+        with cython.critical_section(self):
+            return _vec_mag_sq(&self.val)
 
     def mag(self):
         """Compute the distance from the vector and the origin."""
-        return _vec_mag(&self.val)
+        with cython.critical_section(self):
+            return _vec_mag(&self.val)
 
     def len(self):
         """Compute the distance from the vector and the origin."""
-        return _vec_mag(&self.val)
+        with cython.critical_section(self):
+            return _vec_mag(&self.val)
 
     def dot(self, other) -> float:
         """Return the dot product of both Vectors."""
@@ -1850,11 +1912,12 @@ cdef class VecBase:
 
         conv_vec(&oth, other, False)
 
-        return (
-            self.val.x * oth.x +
-            self.val.y * oth.y +
-            self.val.z * oth.z
-        )
+        with cython.critical_section(self):
+            return (
+                self.val.x * oth.x +
+                self.val.y * oth.y +
+                self.val.z * oth.z
+            )
 
 
     def join(self, delim: str=', ') -> str:
@@ -1862,7 +1925,10 @@ cdef class VecBase:
 
         This strips off the .0 if no decimal portion exists.
         """
-        return _join_triple(&self.val, delim)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _join_triple(&self_val, delim)
 
     def __str__(self) -> str:
         """Return the values, separated by spaces.
@@ -1870,24 +1936,43 @@ cdef class VecBase:
         This is the main format in Valve's file formats.
         This strips off the .0 if no decimal portion exists.
         """
-        return _format_triple(b'%s %s %s', &self.val)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+
+        cdef PyUnicodeWriter *writer = PyUnicodeWriter_Create(6)
+        try:
+            _write_float(writer, self_val.x, 6)
+            PyUnicodeWriter_WriteChar(writer, ' ')
+            _write_float(writer, self_val.y, 6)
+            PyUnicodeWriter_WriteChar(writer, ' ')
+            _write_float(writer, self_val.z, 6)
+            return PyUnicodeWriter_Finish(writer)
+        except:
+            PyUnicodeWriter_Discard(writer)
+            raise
 
     def __format__(self, format_spec: str) -> str:
         """Control how the text is formatted."""
-        return _format_vec_wspec(&self.val, format_spec)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _format_vec_wspec(&self_val, format_spec)
 
     def __iter__(self) -> VecIter:
         cdef VecIter viter = VecIter.__new__(VecIter)
-        viter.a = self.val.x
-        viter.b = self.val.y
-        viter.c = self.val.z
+        with cython.critical_section(self):
+            viter.a = self.val.x
+            viter.b = self.val.y
+            viter.c = self.val.z
         return viter
 
     def __reversed__(self):
         cdef VecIter viter = VecIter.__new__(VecIter)
-        viter.a = self.val.z
-        viter.b = self.val.y
-        viter.c = self.val.x
+        with cython.critical_section(self):
+            viter.a = self.val.z
+            viter.b = self.val.y
+            viter.c = self.val.x
         return viter
 
     def __getitem__(self, ind_obj) -> float:
@@ -1904,24 +1989,26 @@ cdef class VecBase:
             except (TypeError, ValueError, OverflowError):
                 pass
             else:
-                if ind == 0:
-                    return self.val.x
-                elif ind == 1:
-                    return self.val.y
-                elif ind == 2:
-                    return self.val.z
+                with cython.critical_section(self):
+                    if ind == 0:
+                        return self.val.x
+                    elif ind == 1:
+                        return self.val.y
+                    elif ind == 2:
+                        return self.val.z
         else:
             if isinstance(ind_obj, str) and ind_obj is not None and len(<str>ind_obj) == 1:
                 axis = (<str>ind_obj)[0]
 
-                if axis == "x":
-                    return self.val.x
-                elif axis == "y":
-                    return self.val.y
-                elif axis == "z":
-                    return self.val.z
+                with cython.critical_section(self):
+                    if axis == "x":
+                        return self.val.x
+                    elif axis == "y":
+                        return self.val.y
+                    elif axis == "z":
+                        return self.val.z
 
-        raise KeyError(f'Invalid axis {ind_obj!r}' '!')
+        raise KeyError(f'Invalid axis: {ind_obj!r}')
 
 
 @cython.final
@@ -1950,7 +2037,7 @@ cdef class FrozenVec(VecBase):
         """FrozenVec is immutable."""
         return self
 
-    def __deepcopy__(self, memodict=None):
+    def __deepcopy__(self, memodict, /):
         """FrozenVec is immutable."""
         return self
 
@@ -1964,7 +2051,19 @@ cdef class FrozenVec(VecBase):
 
     def __repr__(self) -> str:
         """Code required to reproduce this vector."""
-        return _format_triple(b'FrozenVec(%s, %s, %s)', &self.val)
+        cdef PyUnicodeWriter *writer = PyUnicodeWriter_Create(9)
+        try:
+            PyUnicodeWriter_WriteASCII(writer, b'FrozenVec(', len(b'FrozenVec('))
+            _write_float(writer, self.val.x, 6)
+            PyUnicodeWriter_WriteASCII(writer, b', ', 2)
+            _write_float(writer, self.val.y, 6)
+            PyUnicodeWriter_WriteASCII(writer, b', ', 2)
+            _write_float(writer, self.val.z, 6)
+            PyUnicodeWriter_WriteChar(writer, ')')
+            return PyUnicodeWriter_Finish(writer)
+        except:
+            PyUnicodeWriter_Discard(writer)
+            raise
 
     def __round__(self, object n=0):
         """Performing round() on a FrozenVec rounds each axis."""
@@ -2033,58 +2132,87 @@ cdef class FrozenVec(VecBase):
 cdef class Vec(VecBase):
     """Mutable vector class. This has in-place operations for efficiency."""
     @property
+    @cython.critical_section
     def x(self):
         """The X axis of the vector."""
         return self.val.x
 
     @x.setter
+    @cython.critical_section
     def x(self, value):
         self.val.x = value
 
     @property
+    @cython.critical_section
     def y(self):
         """The Y axis of the vector."""
         return self.val.y
 
     @y.setter
+    @cython.critical_section
     def y(self, value):
         self.val.y = value
 
     @property
+    @cython.critical_section
     def z(self):
         """The Z axis of the vector."""
         return self.val.z
 
     @z.setter
+    @cython.critical_section
     def z(self, value):
         self.val.z = value
 
+    @cython.critical_section
     def copy(self):
         """Create a duplicate of this vector."""
         return _vector_mut(self.val.x, self.val.y, self.val.z)
 
+    @cython.critical_section
     def __copy__(self):
         """Create a duplicate of this vector."""
         return _vector_mut(self.val.x, self.val.y, self.val.z)
 
-    def __deepcopy__(self, memodict=None):
+    @cython.critical_section
+    def __deepcopy__(self, memodict, /):
         """Create a duplicate of this vector."""
         return _vector_mut(self.val.x, self.val.y, self.val.z)
 
+    @cython.critical_section
     def __reduce__(self):
         return unpickle_mvec, (self.val.x, self.val.y, self.val.z)
 
+    @cython.critical_section
     def __repr__(self) -> str:
         """Code required to reproduce this vector."""
-        return _format_triple(b'Vec(%s, %s, %s)', &self.val)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        cdef PyUnicodeWriter *writer = PyUnicodeWriter_Create(9)
+        try:
+            PyUnicodeWriter_WriteASCII(writer, b'Vec(', 4)
+            _write_float(writer, self_val.x, 6)
+            PyUnicodeWriter_WriteASCII(writer, b', ', 2)
+            _write_float(writer, self_val.y, 6)
+            PyUnicodeWriter_WriteASCII(writer, b', ', 2)
+            _write_float(writer, self_val.z, 6)
+            PyUnicodeWriter_WriteChar(writer, ')')
+            return PyUnicodeWriter_Finish(writer)
+        except:
+            PyUnicodeWriter_Discard(writer)
+            raise
 
     def __round__(self, object n=0):
         """Performing round() on a Vec rounds each axis."""
         cdef Vec vec = Vec.__new__(Vec)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
 
-        vec.val.x = round(self.val.x, n)
-        vec.val.y = round(self.val.y, n)
-        vec.val.z = round(self.val.z, n)
+        vec.val.x = round(self_val.x, n)
+        vec.val.y = round(self_val.y, n)
+        vec.val.z = round(self_val.z, n)
 
         return vec
 
@@ -2101,7 +2229,11 @@ cdef class Vec(VecBase):
          The vector is left unchanged if it is equal to (0,0,0).
          """
         cdef Vec vec = Vec.__new__(Vec)
-        _vec_normalise(&vec.val, &self.val)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+
+        _vec_normalise(&vec.val, &self_val)
         return vec
 
     def norm_mask(self, normal):
@@ -2116,11 +2248,13 @@ cdef class Vec(VecBase):
 
         _vec_normalise(&norm, &norm)
 
-        cdef double dot = (
-            self.val.x * norm.x +
-            self.val.y * norm.y +
-            self.val.z * norm.z
-        )
+        cdef double dot
+        with cython.critical_section(self):
+            dot = (
+                self.val.x * norm.x +
+                self.val.y * norm.y +
+                self.val.z * norm.z
+            )
 
         return _vector_mut(
             norm.x * dot,
@@ -2132,7 +2266,10 @@ cdef class Vec(VecBase):
 
     def freeze(self) -> FrozenVec:
         """Return a frozen copy of this vector."""
-        return _vector_frozen(self.val.x, self.val.y, self.val.z)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _vector_frozen(self_val.x, self_val.y, self_val.z)
 
     def rotate(
         self,
@@ -2160,12 +2297,13 @@ cdef class Vec(VecBase):
         angle.z = roll
 
         _mat_from_angle(matrix, &angle)
-        vec_rot(&self.val, matrix)
+        with cython.critical_section(self):
+            _vec_rot(&self.val, matrix)
 
-        if round_vals:
-            self.val.x = round(self.val.x, ROUND_TO)
-            self.val.y = round(self.val.y, ROUND_TO)
-            self.val.z = round(self.val.z, ROUND_TO)
+            if round_vals:
+                self.val.x = round(self.val.x, ROUND_TO)
+                self.val.y = round(self.val.y, ROUND_TO)
+                self.val.z = round(self.val.z, ROUND_TO)
 
         return self
 
@@ -2188,12 +2326,13 @@ cdef class Vec(VecBase):
 
         _parse_vec_str(&angle, ang, pitch, yaw, roll)
         _mat_from_angle(matrix, &angle)
-        vec_rot(&self.val, matrix)
+        with cython.critical_section(self):
+            _vec_rot(&self.val, matrix)
 
-        if round_vals:
-            self.val.x = round(self.val.x, ROUND_TO)
-            self.val.y = round(self.val.y, ROUND_TO)
-            self.val.z = round(self.val.z, ROUND_TO)
+            if round_vals:
+                self.val.x = round(self.val.x, ROUND_TO)
+                self.val.y = round(self.val.y, ROUND_TO)
+                self.val.z = round(self.val.z, ROUND_TO)
 
         return self
 
@@ -2224,17 +2363,19 @@ cdef class Vec(VecBase):
         ang.val.x = ang.val.y = ang.val.z = 0.0
         PyErr_WarnEx(DeprecationWarning, 'Use Matrix.axis_angle().to_angle()', 1)
 
-        if self.val.x != 0 and self.val.y == 0 and self.val.z == 0:
-            ang.val.z = norm_ang(math.copysign(rot, self.val.x))
-        elif self.val.x == 0 and self.val.y != 0 and self.val.z == 0:
-            ang.val.x = norm_ang(math.copysign(rot, self.val.y))
-        elif self.val.x == 0 and self.val.y == 0 and self.val.z != 0:
-            ang.val.y = norm_ang(math.copysign(rot, self.val.z))
-        else:
-            raise ValueError(
-                f'({self.val.x}, {self.val.y}, {self.val.z}) is '
-                'not an on-axis vector!'
-            )
+
+        with cython.critical_section(self):
+            if self.val.x != 0 and self.val.y == 0 and self.val.z == 0:
+                ang.val.z = norm_ang(math.copysign(rot, self.val.x))
+            elif self.val.x == 0 and self.val.y != 0 and self.val.z == 0:
+                ang.val.x = norm_ang(math.copysign(rot, self.val.y))
+            elif self.val.x == 0 and self.val.y == 0 and self.val.z != 0:
+                ang.val.y = norm_ang(math.copysign(rot, self.val.z))
+            else:
+                raise ValueError(
+                    f'({self.val.x}, {self.val.y}, {self.val.z}) is '
+                    'not an on-axis vector!'
+                )
         return ang
 
     # In-place operators. Self is always a Vec.
@@ -2250,9 +2391,10 @@ cdef class Vec(VecBase):
         except (TypeError, ValueError):
             return NotImplemented
 
-        self.val.x += vec_other.x
-        self.val.y += vec_other.y
-        self.val.z += vec_other.z
+        with cython.critical_section(self):
+            self.val.x += vec_other.x
+            self.val.y += vec_other.y
+            self.val.z += vec_other.z
 
         return self
 
@@ -2267,9 +2409,10 @@ cdef class Vec(VecBase):
         except (TypeError, ValueError):
             return NotImplemented
 
-        self.val.x -= vec_other.x
-        self.val.y -= vec_other.y
-        self.val.z -= vec_other.z
+        with cython.critical_section(self):
+            self.val.x -= vec_other.x
+            self.val.y -= vec_other.y
+            self.val.z -= vec_other.z
 
         return self
 
@@ -2279,11 +2422,12 @@ cdef class Vec(VecBase):
         Like the normal one except without duplication.
         """
         cdef double scalar
-        if isinstance(other, (int, float)):
+        if isinstance(other, int | float):
             scalar = other
-            self.val.x *= scalar
-            self.val.y *= scalar
-            self.val.z *= scalar
+            with cython.critical_section(self):
+                self.val.x *= scalar
+                self.val.y *= scalar
+                self.val.z *= scalar
             return self
         elif vec_check(other):
             raise TypeError("Cannot multiply 2 Vectors.")
@@ -2296,11 +2440,12 @@ cdef class Vec(VecBase):
         Like the normal one except without duplication.
         """
         cdef double scalar
-        if isinstance(other, (int, float)):
+        if isinstance(other, int | float):
             scalar = other
-            self.val.x /= scalar
-            self.val.y /= scalar
-            self.val.z /= scalar
+            with cython.critical_section(self):
+                self.val.x /= scalar
+                self.val.y /= scalar
+                self.val.z /= scalar
             return self
         elif vec_check(other):
             raise TypeError("Cannot divide 2 Vectors.")
@@ -2313,11 +2458,12 @@ cdef class Vec(VecBase):
         Like the normal one except without duplication.
         """
         cdef double scalar
-        if isinstance(other, (int, float)):
+        if isinstance(other, int | float):
             scalar = other
-            self.val.x //= scalar
-            self.val.y //= scalar
-            self.val.z //= scalar
+            with cython.critical_section(self):
+                self.val.x //= scalar
+                self.val.y //= scalar
+                self.val.z //= scalar
             return self
         elif vec_check(other):
             raise TypeError("Cannot floor-divide 2 Vectors.")
@@ -2330,11 +2476,12 @@ cdef class Vec(VecBase):
         Like the normal one except without duplication.
         """
         cdef double scalar
-        if isinstance(other, (int, float)):
+        if isinstance(other, int | float):
             scalar = other
-            self.val.x %= scalar
-            self.val.y %= scalar
-            self.val.z %= scalar
+            with cython.critical_section(self):
+                self.val.x %= scalar
+                self.val.y %= scalar
+                self.val.z %= scalar
             return self
         elif vec_check(other):
             raise TypeError("Cannot modulus 2 Vectors.")
@@ -2345,39 +2492,44 @@ cdef class Vec(VecBase):
         """@= operation: rotate the vector by a matrix/angle."""
         cdef mat_t temp
         if angle_check(other):
-            _mat_from_angle(temp, &(<AngleBase>other).val)
-            vec_rot(&self.val, temp)
+            with cython.critical_section(other):
+                _mat_from_angle(temp, &(<AngleBase>other).val)
         elif mat_check(other):
-            vec_rot(&self.val, (<MatrixBase>other).mat)
+            with cython.critical_section(other):
+                memcpy(temp, &(<MatrixBase>other).mat, sizeof(mat_t))
         else:
             return NotImplemented
+        with cython.critical_section(self):
+            _vec_rot(&self.val, temp)
         return self
 
     def max(self, other):
         """Set this vector's values to the maximum of the two vectors."""
         cdef vec_t vec
         conv_vec(&vec, other, scalar=False)
-        if self.val.x < vec.x:
-            self.val.x = vec.x
+        with cython.critical_section(self):
+            if self.val.x < vec.x:
+                self.val.x = vec.x
 
-        if self.val.y < vec.y:
-            self.val.y = vec.y
+            if self.val.y < vec.y:
+                self.val.y = vec.y
 
-        if self.val.z < vec.z:
-            self.val.z = vec.z
+            if self.val.z < vec.z:
+                self.val.z = vec.z
 
     def min(self, other):
         """Set this vector's values to be the minimum of the two vectors."""
         cdef vec_t vec
         conv_vec(&vec, other, scalar=False)
-        if self.val.x > vec.x:
-            self.val.x = vec.x
+        with cython.critical_section(self):
+            if self.val.x > vec.x:
+                self.val.x = vec.x
 
-        if self.val.y > vec.y:
-            self.val.y = vec.y
+            if self.val.y > vec.y:
+                self.val.y = vec.y
 
-        if self.val.z > vec.z:
-            self.val.z = vec.z
+            if self.val.z > vec.z:
+                self.val.z = vec.z
 
     def localise(self, object origin, object angles=None) -> None:
         """Shift this point to be local to the given position and angles.
@@ -2389,10 +2541,11 @@ cdef class Vec(VecBase):
         cdef vec_t offset
         _conv_matrix(matrix, angles)
         conv_vec(&offset, origin, scalar=False)
-        vec_rot(&self.val, matrix)
-        self.val.x += offset.x
-        self.val.y += offset.y
-        self.val.z += offset.z
+        with cython.critical_section(self):
+            _vec_rot(&self.val, matrix)
+            self.val.x += offset.x
+            self.val.y += offset.y
+            self.val.z += offset.z
 
     def __setitem__(self, ind_obj, double val: float) -> None:
         """Allow editing values by index instead of name if desired.
@@ -2408,30 +2561,32 @@ cdef class Vec(VecBase):
             except (TypeError, ValueError, OverflowError):
                 pass
             else:
-                if ind == 0:
-                    self.val.x = val
-                    return
-                elif ind == 1:
-                    self.val.y = val
-                    return
-                elif ind == 2:
-                    self.val.z = val
-                    return
+                with cython.critical_section(self):
+                    if ind == 0:
+                        self.val.x = val
+                        return
+                    elif ind == 1:
+                        self.val.y = val
+                        return
+                    elif ind == 2:
+                        self.val.z = val
+                        return
         else:
             if isinstance(ind_obj, str) and len(<str>ind_obj) == 1:
                 axis = (<str>ind_obj)[0]
 
-                if axis == "x":
-                    self.val.x = val
-                    return
-                elif axis == "y":
-                    self.val.y = val
-                    return
-                elif axis == "z":
-                    self.val.z = val
-                    return
+                with cython.critical_section(self):
+                    if axis == "x":
+                        self.val.x = val
+                        return
+                    elif axis == "y":
+                        self.val.y = val
+                        return
+                    elif axis == "z":
+                        self.val.z = val
+                        return
 
-        raise KeyError(f'Invalid axis {ind_obj!r}' '!')
+        raise KeyError(f'Invalid axis: {ind_obj!r}')
 
     def transform(self):
         """Perform rotations on this Vector efficiently.
@@ -2446,6 +2601,7 @@ cdef class Vec(VecBase):
 @cython.freelist(16)
 cdef class MatrixBase:
     """Common code for both matrices."""
+    @cython.critical_section
     def __init__(self, MatrixBase matrix = None) -> None:
         """Create a new matrix.
 
@@ -2463,16 +2619,19 @@ cdef class MatrixBase:
     def __eq__(self, other: object) -> object:
         if mat_check(other):
             # We can just compare the memory buffers.
-            return memcmp(self.mat, (<MatrixBase>other).mat, sizeof(mat_t)) == 0
+            with cython.critical_section(self, other):
+                return memcmp(self.mat, (<MatrixBase>other).mat, sizeof(mat_t)) == 0
         return NotImplemented
 
     def __ne__(self, other: object) -> object:
         if mat_check(other):
-            return memcmp(self.mat, (<MatrixBase>other).mat, sizeof(mat_t)) != 0
+            with cython.critical_section(self, other):
+                return memcmp(self.mat, (<MatrixBase>other).mat, sizeof(mat_t)) != 0
         return NotImplemented
 
     __hash__ = None
 
+    @cython.critical_section
     def __repr__(self) -> str:
         return (
             '<Matrix '
@@ -2558,7 +2717,8 @@ cdef class MatrixBase:
         cdef MatrixBase rot = _matrix(cls)
         cdef vec_t ang
         if angle_check(pitch):
-            ang = (<AngleBase>pitch).val
+            with cython.critical_section(pitch):
+                ang = (<AngleBase>pitch).val
         elif yaw is None or roll is None:
             raise TypeError('Matrix.from_angles() accepts a single Angle or 3 floats!')
         else:
@@ -2614,14 +2774,17 @@ cdef class MatrixBase:
 
         return mat
 
+    @cython.critical_section
     def forward(self, mag: float = 1.0) -> Vec:
         """Return a vector with the given magnitude pointing along the X axis."""
         return _vector_mut(mag * self.mat[0][0], mag * self.mat[0][1], mag * self.mat[0][2])
 
+    @cython.critical_section
     def left(self, mag: float = 1.0) -> Vec:
         """Return a vector with the given magnitude pointing along the Y axis."""
         return _vector_mut(mag * self.mat[1][0], mag * self.mat[1][1], mag * self.mat[1][2])
 
+    @cython.critical_section
     def up(self, mag: float = 1.0) -> Vec:
         """Return a vector with the given magnitude pointing along the Z axis."""
         return _vector_mut(mag * self.mat[2][0], mag * self.mat[2][1], mag * self.mat[2][2])
@@ -2634,7 +2797,8 @@ cdef class MatrixBase:
         except (ValueError, TypeError, OverflowError):
             raise KeyError(f'Invalid coordinate {item!r}' '!')
         if 0 <= x < 3 and 0 <= y < 3:
-            return self.mat[x][y]
+            with cython.critical_section(self):
+                return self.mat[x][y]
         else:
             raise KeyError(f'Invalid coordinate {x}, {y}' '!')
 
@@ -2646,7 +2810,8 @@ cdef class MatrixBase:
         except (ValueError, TypeError, OverflowError):
             raise KeyError(f'Invalid coordinate {item!r}' '!')
         if 0 <= x < 3 and 0 <= y < 3:
-            self.mat[x][y] = value
+            with cython.critical_section(self):
+                self.mat[x][y] = value
         else:
             raise KeyError(f'Invalid coordinate {x}, {y}' '!')
 
@@ -2657,16 +2822,18 @@ cdef class MatrixBase:
     def to_angle(self) -> Angle:
         """Return an Euler angle replicating this rotation."""
         cdef Angle ang = Angle.__new__(Angle)
-        _mat_to_angle(&ang.val, self.mat)
+        with cython.critical_section(self):
+            _mat_to_angle(&ang.val, self.mat)
         return ang
 
     def transpose(self):
         """Return the transpose of this matrix."""
         cdef MatrixBase rot = _matrix(type(self))
 
-        rot.mat[0] = self.mat[0][0], self.mat[1][0], self.mat[2][0]
-        rot.mat[1] = self.mat[0][1], self.mat[1][1], self.mat[2][1]
-        rot.mat[2] = self.mat[0][2], self.mat[1][2], self.mat[2][2]
+        with cython.critical_section(self):
+            rot.mat[0] = self.mat[0][0], self.mat[1][0], self.mat[2][0]
+            rot.mat[1] = self.mat[0][1], self.mat[1][1], self.mat[2][1]
+            rot.mat[2] = self.mat[0][2], self.mat[1][2], self.mat[2][2]
 
         return rot
 
@@ -2678,7 +2845,10 @@ cdef class MatrixBase:
             cdef bool mat3_inverse(mat_t*, mat_t*)
 
         cdef MatrixBase out = _matrix(type(self))
-        gotinverse = mat3_inverse(&self.mat, &out.mat)
+        cdef mat_t self_val
+        with cython.critical_section(self):
+            memcpy(&self_val, &self.mat, sizeof(mat_t))
+        gotinverse = mat3_inverse(&self_val, &out.mat)
 
         if gotinverse == False:
             raise ArithmeticError(f'Matrix has no inverse: {self!r}')
@@ -2709,41 +2879,52 @@ cdef class MatrixBase:
         cdef AngleBase ang
         if mat_check(first):
             mat = _matrix(type(first))
-            memcpy(mat.mat, (<MatrixBase>first).mat, sizeof(mat_t))
+            with cython.critical_section(first):
+                memcpy(mat.mat, (<MatrixBase>first).mat, sizeof(mat_t))
             if mat_check(second):
-                mat_mul(mat.mat, (<MatrixBase>second).mat)
+                with cython.critical_section(second):
+                    memcpy(temp, (<MatrixBase>second).mat, sizeof(mat_t))
             elif angle_check(second):
-                _mat_from_angle(temp, &(<AngleBase>second).val)
-                mat_mul(mat.mat, temp)
+                with cython.critical_section(second):
+                    _mat_from_angle(temp, &(<AngleBase>second).val)
             else:
                 return NotImplemented
+            _mat_mul(mat.mat, temp)
             return mat
         elif mat_check(second):
             if isinstance(first, Vec):
                 vec = <VecBase>Vec.__new__(Vec)
-                memcpy(&vec.val, &(<VecBase>first).val, sizeof(vec_t))
-                vec_rot(&vec.val, (<MatrixBase>second).mat)
+                with cython.critical_section(first):
+                    memcpy(&vec.val, &(<VecBase>first).val, sizeof(vec_t))
+                with cython.critical_section(second):
+                    _vec_rot(&vec.val, (<MatrixBase>second).mat)
                 return vec
             elif isinstance(first, FrozenVec):
                 vec = <VecBase>FrozenVec.__new__(FrozenVec)
+                # Immutable, no lock required.
                 memcpy(&vec.val, &(<VecBase>first).val, sizeof(vec_t))
-                vec_rot(&vec.val, (<MatrixBase>second).mat)
+                with cython.critical_section(second):
+                    _vec_rot(&vec.val, (<MatrixBase>second).mat)
                 return vec
             elif isinstance(first, tuple):
                 vec = Vec.__new__(Vec)
                 vec.val.x, vec.val.y, vec.val.z = <tuple>first
-                vec_rot(&vec.val, (<MatrixBase>second).mat)
+                with cython.critical_section(second):
+                    _vec_rot(&vec.val, (<MatrixBase>second).mat)
                 return vec
             elif isinstance(first, Angle):
                 ang = Angle.__new__(Angle)
-                _mat_from_angle(temp, &(<AngleBase>first).val)
-                mat_mul(temp, (<MatrixBase>second).mat)
+                with cython.critical_section(first):
+                    _mat_from_angle(temp, &(<AngleBase>first).val)
+                with cython.critical_section(second):
+                    _mat_mul(temp, (<MatrixBase>second).mat)
                 _mat_to_angle(&ang.val, temp)
                 return ang
             elif isinstance(first, FrozenAngle):
                 ang = FrozenAngle.__new__(FrozenAngle)
                 _mat_from_angle(temp, &(<AngleBase>first).val)
-                mat_mul(temp, (<MatrixBase>second).mat)
+                with cython.critical_section(second):
+                    _mat_mul(temp, (<MatrixBase>second).mat)
                 _mat_to_angle(&ang.val, temp)
                 return ang
             else:
@@ -2770,7 +2951,7 @@ cdef class FrozenMatrix(MatrixBase):
         """Frozen matrices are immutable."""
         return self
 
-    def __deepcopy__(self, dict memodict=None) -> FrozenMatrix:
+    def __deepcopy__(self, memodict, /) -> FrozenMatrix:
         """Frozen matrices are immutable."""
         return self
 
@@ -2789,45 +2970,54 @@ cdef class Matrix(MatrixBase):
     def freeze(self):
         """Return a frozen copy of this matrix."""
         cdef FrozenMatrix copy = FrozenMatrix.__new__(FrozenMatrix)
-        memcpy(copy.mat, self.mat, sizeof(mat_t))
+        with cython.critical_section(self):
+            memcpy(copy.mat, self.mat, sizeof(mat_t))
         return copy
 
     def copy(self) -> Matrix:
         """Duplicate this matrix."""
         cdef Matrix copy = Matrix.__new__(type(self))
-        memcpy(copy.mat, self.mat, sizeof(mat_t))
+        with cython.critical_section(self):
+            memcpy(copy.mat, self.mat, sizeof(mat_t))
         return copy
 
     def __copy__(self) -> Matrix:
         """Duplicate this matrix."""
         cdef Matrix copy = Matrix.__new__(Matrix)
-        memcpy(copy.mat, self.mat, sizeof(mat_t))
+        with cython.critical_section(self):
+            memcpy(copy.mat, self.mat, sizeof(mat_t))
         return copy
 
-    def __deepcopy__(self, dict memodict=None) -> MatrixBase:
+    def __deepcopy__(self, memodict, /) -> MatrixBase:
         """Duplicate this matrix."""
         cdef Matrix copy = Matrix.__new__(Matrix)
-        memcpy(copy.mat, self.mat, sizeof(mat_t))
+        with cython.critical_section(self):
+            memcpy(copy.mat, self.mat, sizeof(mat_t))
         return copy
 
     def __reduce__(self) -> tuple:
+        cdef mat_t self_val
+        with cython.critical_section(self):
+            memcpy(self_val, self.mat, sizeof(mat_t))
         return unpickle_mmat, (
-            self.mat[0][0], self.mat[0][1], self.mat[0][2],
-            self.mat[1][0], self.mat[1][1], self.mat[1][2],
-            self.mat[2][0], self.mat[2][1], self.mat[2][2],
+            self_val[0][0], self_val[0][1], self_val[0][2],
+            self_val[1][0], self_val[1][1], self_val[1][2],
+            self_val[2][0], self_val[2][1], self_val[2][2],
         )
 
     def __imatmul__(self, other):
         cdef mat_t temp
         if mat_check(other):
-            mat_mul(self.mat, (<MatrixBase>other).mat)
-            return self
+            with cython.critical_section(other):
+                memcpy(temp, (<MatrixBase>other).mat, sizeof(mat_t))
         elif angle_check(other):
-            _mat_from_angle(temp, &(<AngleBase>other).val)
-            mat_mul(self.mat, temp)
-            return self
+            with cython.critical_section(other):
+                _mat_from_angle(temp, &(<AngleBase>other).val)
         else:
             return NotImplemented
+        with cython.critical_section(self):
+            _mat_mul(self.mat, temp)
+        return self
 
 
 # Lots of temporaries are expected.
@@ -2837,6 +3027,7 @@ cdef class AngleBase:
     __match_args__ = ('pitch', 'yaw', 'roll')
     __hash__ = None
 
+    @cython.critical_section
     def __init__(self, pitch=0.0, yaw=0.0, roll=0.0) -> None:
         """Create an Angle.
 
@@ -2849,7 +3040,7 @@ cdef class AngleBase:
         if type(self) is AngleBase:
             raise TypeError('This class cannot be instantiated!')
 
-        if isinstance(pitch, float) or isinstance(pitch, int):
+        if isinstance(pitch, int | float):
             self.val.x = norm_ang(pitch)
             self.val.y = norm_ang(yaw)
             self.val.z = norm_ang(roll)
@@ -2941,17 +3132,20 @@ cdef class AngleBase:
             axis = args[i]
             if axis in ('p', 'pit', 'pitch'):
                 if angle_check(axis_val):
-                    ang.val.x = (<AngleBase>axis_val).val.x
+                    with cython.critical_section(axis_val):
+                        ang.val.x = (<AngleBase>axis_val).val.x
                 else:
                     ang.val.x = norm_ang(axis_val)
             elif axis in ('y', 'yaw'):
                 if angle_check(axis_val):
-                    ang.val.y = (<AngleBase>axis_val).val.y
+                    with cython.critical_section(axis_val):
+                        ang.val.y = (<AngleBase>axis_val).val.y
                 else:
                     ang.val.y = norm_ang(axis_val)
             elif axis in ('r', 'rol', 'roll'):
                 if angle_check(axis_val):
-                    ang.val.z = (<AngleBase>axis_val).val.z
+                    with cython.critical_section(axis_val):
+                        ang.val.z = (<AngleBase>axis_val).val.z
                 else:
                     ang.val.z = norm_ang(axis_val)
 
@@ -2965,23 +3159,46 @@ cdef class AngleBase:
         vectors.
         This strips off the .0 if no decimal portion exists.
         """
-        return _format_triple(b'%s %s %s', &self.val)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
 
-    def __format__(self, format_spec: str) -> str:
+        cdef PyUnicodeWriter *writer = PyUnicodeWriter_Create(6)
+        try:
+            _write_float(writer, self_val.x, 6)
+            PyUnicodeWriter_WriteChar(writer, ' ')
+            _write_float(writer, self_val.y, 6)
+            PyUnicodeWriter_WriteChar(writer, ' ')
+            _write_float(writer, self_val.z, 6)
+            return PyUnicodeWriter_Finish(writer)
+        except:
+            PyUnicodeWriter_Discard(writer)
+            raise
+
+    def __format__(self, format_spec: str, /) -> str:
         """Control how the text is formatted."""
-        return _format_vec_wspec(&self.val, format_spec)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _format_vec_wspec(&self_val, format_spec)
 
     def as_tuple(self):
         """Return the Angle as a tuple."""
         PyErr_WarnEx(DeprecationWarning, 'Vec_tuple is deprecated, use FrozenVec instead.', 1)
-        return _make_tuple(self.val.x, self.val.y, self.val.z)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _make_tuple(self_val.x, self_val.y, self_val.z)
 
     def join(self, delim: str=', ') -> str:
         """Return a string with all numbers joined by the passed delimiter.
 
         This strips off the .0 if no decimal portion exists.
         """
-        return _join_triple(&self.val, delim)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _join_triple(&self_val, delim)
 
     def __len__(self) -> int:
         """The length of an Angle is always 3."""
@@ -2990,17 +3207,19 @@ cdef class AngleBase:
     def __iter__(self) -> VecIter:
         """Iterating over the angles returns each value in turn."""
         cdef VecIter viter = VecIter.__new__(VecIter)
-        viter.a = self.val.x
-        viter.b = self.val.y
-        viter.c = self.val.z
+        with cython.critical_section(self):
+            viter.a = self.val.x
+            viter.b = self.val.y
+            viter.c = self.val.z
         return viter
 
     def __reversed__(self) -> VecIter:
         """Iterating over the angles returns each value in turn."""
         cdef VecIter viter = VecIter.__new__(VecIter)
-        viter.a = self.val.z
-        viter.b = self.val.y
-        viter.c = self.val.x
+        with cython.critical_section(self):
+            viter.a = self.val.z
+            viter.b = self.val.y
+            viter.c = self.val.x
         return viter
 
     def __getitem__(self, pos):
@@ -3018,28 +3237,31 @@ cdef class AngleBase:
 
         if isinstance(pos, int):
             index = <int>pos
-            if index == 0:
-                return self.val.x
-            if index == 1:
-                return self.val.y
-            if index == 2:
-                return self.val.z
+            with cython.critical_section(self):
+                if index == 0:
+                    return self.val.x
+                if index == 1:
+                    return self.val.y
+                if index == 2:
+                    return self.val.z
         elif isinstance(pos, str):
             key = <str>pos
-            if key in ('p', 'pit', 'pitch'):
-                return self.val.x
-            elif key in ('y', 'yaw'):
-                return self.val.y
-            elif key in ('r', 'rol', 'roll'):
-                return self.val.z
+            with cython.critical_section(self):
+                if key in ('p', 'pit', 'pitch'):
+                    return self.val.x
+                elif key in ('y', 'yaw'):
+                    return self.val.y
+                elif key in ('r', 'rol', 'roll'):
+                    return self.val.z
         raise KeyError(f'Invalid axis: {pos!r}')
 
     def __mul__(obj_a, obj_b):
         """Angle * float multiplies each value."""
         cdef double scalar
-        cdef AngleBase angle, res
+        cdef vec_t angle
+        cdef AngleBase res
         # Angle * Angle is disallowed.
-        if isinstance(obj_a, (int, float)):
+        if isinstance(obj_a, int | float):
             # scalar * vector
             if type(obj_b) is Angle:
                 res = Angle.__new__(Angle)
@@ -3047,12 +3269,13 @@ cdef class AngleBase:
                 res = FrozenAngle.__new__(FrozenAngle)
             else:  # Both aren't us??
                 return NotImplemented
-            angle = <AngleBase>obj_b
+            with cython.critical_section(obj_b):
+                angle = (<AngleBase>obj_b).val
             scalar = obj_a
-            res.val.x = norm_ang(scalar * angle.val.x)
-            res.val.y = norm_ang(scalar * angle.val.y)
-            res.val.z = norm_ang(scalar * angle.val.z)
-        elif isinstance(obj_b, (int, float)):
+            res.val.x = norm_ang(scalar * angle.x)
+            res.val.y = norm_ang(scalar * angle.y)
+            res.val.z = norm_ang(scalar * angle.z)
+        elif isinstance(obj_b, int | float):
             # vector * scalar.
             if type(obj_a) is Angle:
                 res = Angle.__new__(Angle)
@@ -3060,12 +3283,12 @@ cdef class AngleBase:
                 res = FrozenAngle.__new__(FrozenAngle)
             else:  # Both aren't us??
                 return NotImplemented
-
-            angle = <AngleBase>obj_a
+            with cython.critical_section(obj_a):
+                angle = (<AngleBase>obj_a).val
             scalar = obj_b
-            res.val.x = norm_ang(angle.val.x * scalar)
-            res.val.y = norm_ang(angle.val.y * scalar)
-            res.val.z = norm_ang(angle.val.z * scalar)
+            res.val.x = norm_ang(angle.x * scalar)
+            res.val.y = norm_ang(angle.y * scalar)
+            res.val.z = norm_ang(angle.z * scalar)
 
         elif angle_check(obj_a) and angle_check(obj_b):
             raise TypeError('Cannot multiply 2 Angles.')
@@ -3079,45 +3302,51 @@ cdef class AngleBase:
         """Implement rotations."""
         cdef mat_t temp1, temp2
         if angle_check(first):
-            _mat_from_angle(temp1, &(<AngleBase>first).val)
+            with cython.critical_section(first):
+                _mat_from_angle(temp1, &(<AngleBase>first).val)
             if angle_check(second):
-                _mat_from_angle(temp2, &(<AngleBase>second).val)
-                mat_mul(temp1, temp2)
+                with cython.critical_section(second):
+                    _mat_from_angle(temp2, &(<AngleBase>second).val)
+                _mat_mul(temp1, temp2)
             elif mat_check(second):
-                mat_mul(temp1, (<MatrixBase>second).mat)
+                with cython.critical_section(second):
+                    _mat_mul(temp1, (<MatrixBase>second).mat)
             else:
                 return NotImplemented
             res = pick_ang_type(type(first), type(second))
             _mat_to_angle(&(<AngleBase>res).val, temp1)
             return res
         elif angle_check(second):
-            _mat_from_angle(temp2, &(<AngleBase>second).val)
+            with cython.critical_section(second):
+                _mat_from_angle(temp2, &(<AngleBase>second).val)
             if isinstance(first, tuple):
                 res = Vec.__new__(Vec)
                 (<Vec>res).val.x, (<Vec>res).val.y, (<Vec>res).val.z = <tuple>first
-                vec_rot(&(<Vec>res).val, temp2)
+                _vec_rot(&(<Vec>res).val, temp2)
                 return res
             # These classes should do this themselves, but this is here for
             # completeness.
             if isinstance(first, Matrix):
                 res = Matrix.__new__(Matrix)
-                memcpy((<Matrix>res).mat, (<Matrix>first).mat, sizeof(mat_t))
-                mat_mul((<Matrix>res).mat, temp2)
+                with cython.critical_section(first):
+                    memcpy((<Matrix>res).mat, (<Matrix>first).mat, sizeof(mat_t))
+                _mat_mul((<Matrix>res).mat, temp2)
                 return res
             if isinstance(first, FrozenMatrix):
                 res = FrozenMatrix.__new__(FrozenMatrix)
                 memcpy((<FrozenMatrix>res).mat, (<FrozenMatrix>first).mat, sizeof(mat_t))
-                mat_mul((<FrozenMatrix>res).mat, temp2)
+                _mat_mul((<FrozenMatrix>res).mat, temp2)
                 return res
             elif isinstance(first, Vec):
                 res = Vec.__new__(Vec)
-                memcpy(&(<Vec>res).val, &(<Vec>first).val, sizeof(vec_t))
-                vec_rot(&(<Vec>res).val, temp2)
+                with cython.critical_section(first):
+                    memcpy(&(<Vec>res).val, &(<Vec>first).val, sizeof(vec_t))
+                _vec_rot(&(<Vec>res).val, temp2)
                 return res
             elif isinstance(first, FrozenVec):
                 res = FrozenVec.__new__(FrozenVec)
                 memcpy(&(<FrozenVec>res).val, &(<FrozenVec>first).val, sizeof(vec_t))
-                vec_rot(&(<FrozenVec>res).val, temp2)
+                _vec_rot(&(<FrozenVec>res).val, temp2)
                 return res
 
         return NotImplemented
@@ -3172,13 +3401,25 @@ cdef class FrozenAngle(AngleBase):
         return _angle_mut(self.val.x, self.val.y, self.val.z)
 
     def __repr__(self) -> str:
-        return _format_triple(b'FrozenAngle(%s, %s, %s)', &self.val)
+        cdef PyUnicodeWriter *writer = PyUnicodeWriter_Create(9)
+        try:
+            PyUnicodeWriter_WriteASCII(writer, b'FrozenAngle(', len(b'FrozenAngle('))
+            _write_float(writer, self.val.x, 6)
+            PyUnicodeWriter_WriteASCII(writer, b', ', 2)
+            _write_float(writer, self.val.y, 6)
+            PyUnicodeWriter_WriteASCII(writer, b', ', 2)
+            _write_float(writer, self.val.z, 6)
+            PyUnicodeWriter_WriteChar(writer, ')')
+            return PyUnicodeWriter_Finish(writer)
+        except:
+            PyUnicodeWriter_Discard(writer)
+            raise
 
     def __copy__(self):
         """FrozenAngle is immutable."""
         return self
 
-    def __deepcopy__(self, memodict=None):
+    def __deepcopy__(self, memodict, /):
         """FrozenAngle is immutable."""
         return self
 
@@ -3210,52 +3451,88 @@ cdef class Angle(AngleBase):
     """
     def copy(self) -> Angle:
         """Create a duplicate of this angle."""
-        return _angle_mut(self.val.x, self.val.y, self.val.z)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _angle_mut(self_val.x, self_val.y, self_val.z)
 
     def __copy__(self) -> Angle:
         """Create a duplicate of this angle."""
-        return _angle_mut(self.val.x, self.val.y, self.val.z)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _angle_mut(self_val.x, self_val.y, self_val.z)
 
-    def __deepcopy__(self, dict memodict=None) -> Angle:
+    def __deepcopy__(self, memodict, /) -> Angle:
         """Create a duplicate of this angle."""
-        return _angle_mut(self.val.x, self.val.y, self.val.z)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _angle_mut(self_val.x, self_val.y, self_val.z)
 
     def freeze(self):
         """Return a frozen copy of this angle."""
-        return _angle_frozen(self.val.x, self.val.y, self.val.z)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return _angle_frozen(self_val.x, self_val.y, self_val.z)
 
     def __reduce__(self):
-        return unpickle_mang, (self.val.x, self.val.y, self.val.z)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        return unpickle_mang, (self_val.x, self_val.y, self_val.z)
 
     @property
+    @cython.critical_section
     def pitch(self) -> float:
         """The Y-axis rotation, performed second."""
         return self.val.x
 
     @pitch.setter
+    @cython.critical_section
     def pitch(self, double pitch) -> None:
         self.val.x = norm_ang(pitch)
 
     @property
+    @cython.critical_section
     def yaw(self) -> float:
         """The Z-axis rotation, performed last."""
         return self.val.y
 
     @yaw.setter
+    @cython.critical_section
     def yaw(self, double yaw) -> None:
         self.val.y = norm_ang(yaw)
 
     @property
+    @cython.critical_section
     def roll(self) -> float:
         """The X-axis rotation, performed first."""
         return self.val.z
 
     @roll.setter
+    @cython.critical_section
     def roll(self, double roll) -> None:
         self.val.z = norm_ang(roll)
 
     def __repr__(self) -> str:
-        return _format_triple(b'Angle(%s, %s, %s)', &self.val)
+        cdef vec_t self_val
+        with cython.critical_section(self):
+            self_val = self.val
+        cdef PyUnicodeWriter *writer = PyUnicodeWriter_Create(9)
+        try:
+            PyUnicodeWriter_WriteASCII(writer, b'Angle(', len(b'Angle('))
+            _write_float(writer, self.val.x, 6)
+            PyUnicodeWriter_WriteASCII(writer, b', ', 2)
+            _write_float(writer, self.val.y, 6)
+            PyUnicodeWriter_WriteASCII(writer, b', ', 2)
+            _write_float(writer, self.val.z, 6)
+            PyUnicodeWriter_WriteChar(writer, ')')
+            return PyUnicodeWriter_Finish(writer)
+        except:
+            PyUnicodeWriter_Discard(writer)
+            raise
 
     @classmethod
     def from_basis(
@@ -3286,20 +3563,22 @@ cdef class Angle(AngleBase):
 
         if isinstance(pos, int):
             index = <int>pos
-            if index == 0:
-                self.val.x = val
-            if index == 1:
-                self.val.y = val
-            if index == 2:
-                self.val.z = val
+            with cython.critical_section(self):
+                if index == 0:
+                    self.val.x = val
+                if index == 1:
+                    self.val.y = val
+                if index == 2:
+                    self.val.z = val
         elif isinstance(pos, str):
             key = <str>pos
-            if key in ('p', 'pit', 'pitch'):
-                self.val.x = val
-            elif key in ('y', 'yaw'):
-                self.val.y = val
-            elif key in ('r', 'rol', 'roll'):
-                self.val.z = val
+            with cython.critical_section(self):
+                if key in ('p', 'pit', 'pitch'):
+                    self.val.x = val
+                elif key in ('y', 'yaw'):
+                    self.val.y = val
+                elif key in ('r', 'rol', 'roll'):
+                    self.val.z = val
         raise KeyError(f'Invalid axis: {pos!r}')
 
     __hash__ = None
@@ -3317,26 +3596,30 @@ cdef class Angle(AngleBase):
         Like the normal one except without duplication.
         """
         cdef double scalar
-        if isinstance(other, (int, float)):
+        if isinstance(other, int | float):
             scalar = other
-            self.val.x = norm_ang(self.val.x * scalar)
-            self.val.y = norm_ang(self.val.y * scalar)
-            self.val.z = norm_ang(self.val.z * scalar)
+            with cython.critical_section(self):
+                self.val.x = norm_ang(self.val.x * scalar)
+                self.val.y = norm_ang(self.val.y * scalar)
+                self.val.z = norm_ang(self.val.z * scalar)
             return self
         else:
             return NotImplemented
 
     def __imatmul__(self, second):
         cdef mat_t mat_self, temp2
-        _mat_from_angle(mat_self, &(<Angle>self).val)
         if angle_check(second):
-            _mat_from_angle(temp2, &(<AngleBase>second).val)
-            mat_mul(mat_self, temp2)
+            with cython.critical_section(second):
+                _mat_from_angle(temp2, &(<AngleBase>second).val)
         elif mat_check(second):
-            mat_mul(mat_self, (<MatrixBase>second).mat)
+            with cython.critical_section(second):
+                memcpy(temp2, (<MatrixBase>second).mat, sizeof(mat_t))
         else:
             return NotImplemented
-        _mat_to_angle(&self.val, mat_self)
+        with cython.critical_section(self):
+            _mat_from_angle(mat_self, &(<Angle>self).val)
+            _mat_mul(mat_self, temp2)
+            _mat_to_angle(&self.val, mat_self)
         return self
 
     def transform(self):
@@ -3349,16 +3632,18 @@ cdef class Angle(AngleBase):
         return AngleTransform.__new__(AngleTransform, self)
 
 
-def quickhull(vertexes: typing.Iterable[Vec]) -> typing.List[typing.Tuple[Vec, Vec, Vec]]:
+def quickhull(vertexes: Iterable) -> list[tuple[Vec, Vec, Vec]]:
     """Use the quickhull algorithm to construct a convex hull around the provided points."""
     cdef size_t v1, v2, v3, ind
     cdef vector[quickhull.Vector3[double]] values = vector[quickhull.Vector3[double]]()
     cdef list vert_list, result
-    cdef Vec vecobj
+    cdef vec_t vec
     cdef quickhull.QuickHull[double] qhull = quickhull.QuickHull[double]()
 
     for vecobj in vertexes:
-        values.push_back(quickhull.Vector3[double](vecobj.val.x, vecobj.val.y, vecobj.val.z))
+        conv_vec(&vec, vecobj, scalar=False)
+        with cython.critical_section(vecobj):
+            values.push_back(quickhull.Vector3[double](vec.x, vec.y, vec.z))
 
     cdef quickhull.ConvexHull[double] result_hull = qhull.getConvexHull(values, False, False)
 
@@ -3383,10 +3668,13 @@ from cpython.object cimport PyTypeObject
 
 
 if USE_TYPE_INTERNALS:
+    (<PyTypeObject *>VecBase).tp_name = b"srctools.math.VecBase"
     (<PyTypeObject *>Vec).tp_name = b"srctools.math.Vec"
     (<PyTypeObject *>FrozenVec).tp_name = b"srctools.math.FrozenVec"
+    (<PyTypeObject *>AngleBase).tp_name = b"srctools.math.AngleBase"
     (<PyTypeObject *>Angle).tp_name = b"srctools.math.Angle"
     (<PyTypeObject *>FrozenAngle).tp_name = b"srctools.math.FrozenAngle"
+    (<PyTypeObject *>MatrixBase).tp_name = b"srctools.math.MatrixBase"
     (<PyTypeObject *>Matrix).tp_name = b"srctools.math.Matrix"
     (<PyTypeObject *>FrozenMatrix).tp_name = b"srctools.math.FrozenMatrix"
     (<PyTypeObject *>VecIter).tp_name = b"srctools.math._Vec_or_Angle_iterator"
@@ -3402,6 +3690,7 @@ try:
 except Exception:
     pass  # Perfectly fine.
 
+# These are methods not functions.
 del cross_vec, cross_frozenvec
 # Drop references.
-typing = None
+del Iterator, Iterable, Union, MappingProxyType

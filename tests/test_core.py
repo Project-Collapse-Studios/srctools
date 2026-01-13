@@ -1,14 +1,18 @@
 """Test functionality in srctools.__init__."""
-from typing import Any
+from typing import Any, Union
+import pickle
+
+from collections.abc import Set as AbstractSet, Callable, KeysView, ItemsView
 from pathlib import Path
 
 from dirty_equals import IsList
 import pytest
 
 from helpers import ExactType
+# noinspection PyProtectedMember
 from srctools import (
-    EmptyMapping, _cy_conv_bool, _cy_conv_float, _cy_conv_int, _py_conv_bool,
-    _py_conv_float, _py_conv_int,
+    EmptyMapping, EmptyKeysView, EmptyValuesView, EmptyItemsView,
+    _cy_conv_bool, _cy_conv_float, _cy_conv_int, _py_conv_bool, _py_conv_float, _py_conv_int,
 )
 import srctools
 
@@ -108,14 +112,14 @@ def test_bool_as_int() -> None:
     [_py_conv_int, _cy_conv_int],
     ids=['Python', 'Cython'],
 )
-def test_conv_int(func) -> None:
+def test_conv_int(func: Callable[..., int]) -> None:
     """Test srctools.conv_int()."""
     for st_int, result in ints:
         assert func(st_int) == result, st_int
 
     # Check that float values fail
     marker = object()
-    for st_float, result in floats:
+    for st_float, _ in floats:
         if isinstance(st_float, str):  # We don't want to check float-rounding
             assert func(st_float, marker) is marker, repr(st_float)
 
@@ -124,7 +128,7 @@ def test_conv_int(func) -> None:
         assert func(st_obj) == 0
         for default in def_vals:
             # Check all default values pass through unchanged
-            assert func(st_obj, default) is default, repr(st_obj)  # type: ignore
+            assert func(st_obj, default) is default, repr(st_obj)
 
 
 @pytest.mark.parametrize(
@@ -132,7 +136,7 @@ def test_conv_int(func) -> None:
     [_py_conv_bool, _cy_conv_bool],
     ids=['Python', 'Cython'],
 )
-def test_conv_bool(func) -> None:
+def test_conv_bool(func: Callable[..., bool]) -> None:
     """Test srctools.conv_bool()."""
     for val in true_strings:
         assert func(val) is True
@@ -144,12 +148,12 @@ def test_conv_bool(func) -> None:
     assert func(False) is False
 
     # None passes through the default
-    for val in non_bools:
+    for bad_val in non_bools:
         # Check default value.
-        assert func(val) is False
+        assert func(bad_val) is False
         # Check all default values pass through unchanged
         for default in def_vals:
-            assert func(val, default) is default
+            assert func(bad_val, default) is default
 
 
 @pytest.mark.parametrize(
@@ -157,7 +161,7 @@ def test_conv_bool(func) -> None:
     [_py_conv_float, _cy_conv_float],
     ids=['Python', 'Cython'],
 )
-def test_conv_float(func) -> None:
+def test_conv_float(func: Callable[..., float]) -> None:
     """Test srctools.conv_float()."""
     # Float should convert integers too
     for string, result in ints:
@@ -172,15 +176,18 @@ def test_conv_float(func) -> None:
             assert func(string, default) is default
 
 
-# noinspection PyStatementEffect, PyCallingNonCallable
+# noinspection PyStatementEffect, PyUnreachableCode
 def test_EmptyMapping() -> None:
     marker = object()
     
     # It should be possible to 'construct' an instance..
-    assert EmptyMapping() is EmptyMapping  # type: ignore
+    assert EmptyMapping() is EmptyMapping
 
     # Must be passable to dict()
     assert dict(EmptyMapping) == {}
+
+    assert repr(EmptyMapping) == 'srctools.EmptyMapping'
+    assert str(EmptyMapping) == 'srctools.EmptyMapping'
 
     # EmptyMapping['x'] raises in various forms.
     assert 'x' not in EmptyMapping
@@ -222,7 +229,7 @@ def test_EmptyMapping() -> None:
     # Can't give more than one mapping as a positional argument,
     # though.
     with pytest.raises(TypeError):
-        EmptyMapping.update({3: 4}, {1: 2})
+        EmptyMapping.update({3: 4}, {1: 2})  # type: ignore
 
     # Check it's registered in ABCs.
     from collections import abc
@@ -233,37 +240,63 @@ def test_EmptyMapping() -> None:
 
 
 def test_EmptyMapping_keys() -> None:
-    """Test EmptyMapping.keys() works."""
-    assert len(EmptyMapping.keys()) == 0
-    assert object() not in EmptyMapping.keys()
-    check_empty_iterable(EmptyMapping.keys(), 'keys()')
+    """Test EmptyKeysView works."""
+    assert EmptyMapping.keys() is EmptyKeysView
+    check_empty_iterable(EmptyKeysView, 'keys()')
+
+    assert len(EmptyKeysView) == 0
+    assert object() not in EmptyKeysView
+    assert str(EmptyKeysView) == 'srctools.EmptyKeysView'
+    assert repr(EmptyKeysView) == 'srctools.EmptyKeysView'
+    assert hash(EmptyKeysView) == hash(frozenset())
 
     # Check it's registered in ABCs.
     from collections import abc
-    assert isinstance(EmptyMapping.keys(), abc.MappingView)
-    assert isinstance(EmptyMapping.items(), abc.Set)
-    assert isinstance(EmptyMapping.keys(), abc.KeysView)
+    assert isinstance(EmptyKeysView, abc.MappingView)
+    assert isinstance(EmptyItemsView, abc.Set)
+    assert isinstance(EmptyKeysView, abc.KeysView)
 
 
 def test_EmptyMapping_values() -> None:
-    """Test EmptyMapping.values() works. This isn't a Set."""
-    check_empty_iterable(EmptyMapping.values(), 'values()')
+    """Test EmptyValuesView works. This isn't a Set."""
+    assert EmptyMapping.values() is EmptyValuesView
+    check_empty_iterable(EmptyValuesView, 'values()')
+
+    assert len(EmptyValuesView) == 0
+    assert object() not in EmptyValuesView
+    assert str(EmptyValuesView) == 'srctools.EmptyValuesView'
+    assert repr(EmptyValuesView) == 'srctools.EmptyValuesView'
 
     # Check it's registered in ABCs.
     from collections import abc
-    assert isinstance(EmptyMapping.values(), abc.MappingView)
-    assert isinstance(EmptyMapping.values(), abc.ValuesView)
+    assert isinstance(EmptyValuesView, abc.MappingView)
+    assert isinstance(EmptyValuesView, abc.ValuesView)
 
 
 def test_EmptyMapping_items() -> None:
-    """Test EmptyMapping.items() works."""
-    check_empty_iterable(EmptyMapping.items(), 'items()', item=('x', 'y'))
+    """Test EmptyItemsView works."""
+    assert EmptyItemsView is EmptyItemsView
+    check_empty_iterable(EmptyItemsView, 'items()', item=('x', 'y'))
+
+    assert len(EmptyItemsView) == 0
+    assert (object(), object()) not in EmptyItemsView
+    assert str(EmptyItemsView) == 'srctools.EmptyItemsView'
+    assert repr(EmptyItemsView) == 'srctools.EmptyItemsView'
+    assert hash(EmptyItemsView) == hash(frozenset())
 
     # Check it's registered in ABCs.
     from collections import abc
-    assert isinstance(EmptyMapping.items(), abc.MappingView)
-    assert isinstance(EmptyMapping.items(), abc.Set)
-    assert isinstance(EmptyMapping.items(), abc.ItemsView)
+    assert isinstance(EmptyItemsView, abc.MappingView)
+    assert isinstance(EmptyItemsView, abc.Set)
+    assert isinstance(EmptyItemsView, abc.ItemsView)
+
+
+@pytest.mark.parametrize('version', range(pickle.HIGHEST_PROTOCOL + 1), ids=lambda x: f'v{x}')
+@pytest.mark.parametrize('empty', [EmptyMapping, EmptyKeysView, EmptyValuesView, EmptyItemsView], ids=repr)
+def test_EmptyMapping_pickle(empty: object, version: int) -> None:
+    """Test pickling EmptyMapping and its views."""
+    serial = pickle.dumps(empty, version)
+    assert pickle.loads(serial) is empty
 
 
 @pytest.mark.parametrize(
@@ -271,16 +304,19 @@ def test_EmptyMapping_items() -> None:
     [EmptyMapping.keys(), EmptyMapping.items()],
     ids=['keys', 'items'],
 )
-def test_EmptyMapping_set_ops(view) -> None:
+def test_EmptyMapping_set_ops(view: Union[KeysView[Any], ItemsView[Any, Any]]) -> None:
     """Test EmptyMapping.keys() and items() support set ops."""
-    empty: set[object] = set()
+    empty: AbstractSet[Any] = set()
     # Ensure it's valid as an items() tuple.
-    full = {('key', 1), ('key2', 4)}
+    full: AbstractSet[Any] = {('key', 1), ('key2', 4)}
+    invalid: Any = object()  # Should give NotImplemented, cast as Any to ignore (correct) errors.
 
     assert empty == view
     assert not (full == view)
     assert view == empty
     assert not (view == full)
+    assert empty != invalid
+    assert not (empty == invalid)
     
     assert full != view
     assert not (empty != view)
@@ -291,38 +327,46 @@ def test_EmptyMapping_set_ops(view) -> None:
     assert full >= view
     assert view >= empty
     assert not (view >= full)
+    assert empty.__ge__(invalid) is NotImplemented
 
     assert not (empty > view)
     assert full > view
     assert not (view > empty)
     assert not (view > full)
+    assert empty.__gt__(invalid) is NotImplemented
     
     assert not (view < empty)
     assert view < full
     assert not (empty < view)
     assert not (full < view)
+    assert empty.__lt__(invalid) is NotImplemented
     
     assert view <= empty
     assert view <= full
     assert empty <= view
     assert not (full <= view)
+    assert empty.__le__(invalid) is NotImplemented
     
     assert view.isdisjoint(full)
     assert view.isdisjoint(empty)
 
     assert (view | empty) == (empty | view) == empty
     assert (view | full) == (full | view) == full
+    assert empty.__or__(invalid) is NotImplemented
 
     assert (view & empty) == (empty & view) == empty
     assert (view & full) == (full & view) == empty
+    assert empty.__and__(invalid) is NotImplemented
 
     assert view - empty == empty
     assert view - full == empty
     assert empty - view == empty
     assert full - view == full
+    assert empty.__sub__(invalid) is NotImplemented
 
     assert (view ^ empty) == (empty ^ view) == empty
     assert (view ^ full) == (full ^ view) == full
+    assert empty.__xor__(invalid) is NotImplemented
 
 
 def test_quote_escape() -> None:
@@ -386,12 +430,82 @@ def test_atomic_writer_fails(tmp_path: Path) -> None:
     writer = srctools.AtomicWriter(filename, is_bytes=True)
     assert filename.read_bytes() == b'existing_data'
     assert list(tmp_path.iterdir()) == [filename]  # No other files yet.
-    with pytest.raises(ZeroDivisionError):
+    try:
         with writer as dest:
             dest.write(b'some partial new data')
             # File was created.
             assert list(tmp_path.iterdir()) == IsList(filename, Path(dest.name), check_order=False)
             raise ZeroDivisionError
+    except ZeroDivisionError:
+        pass
     assert list(tmp_path.iterdir()) == [filename]   # Temp file is removed.
     # And data wasn't changed.
     assert filename.read_bytes() == b'existing_data'
+
+
+# noinspection PyDeprecation
+def test_alias_math() -> None:
+    """Test the lazy srctools.Vec_tuple alias."""
+    from srctools.math import Vec_tuple
+    with pytest.deprecated_call():
+        assert srctools.Vec_tuple is Vec_tuple  # type: ignore[attr-defined]
+    # This isn't put in the dict, we want a warning each time.
+
+
+def test_alias_vmf() -> None:
+    """Test the lazy srctools.vmf.* aliases."""
+    from srctools.vmf import VMF, Entity, Solid, Side, Output, UVAxis
+    assert srctools.VMF is VMF
+    assert srctools.Entity is Entity
+    assert srctools.Solid is Solid
+    assert srctools.Side is Side
+    assert srctools.Output is Output
+    assert srctools.UVAxis is UVAxis
+    assert 'Entity' in vars(srctools)
+    assert 'Output' in vars(srctools)
+
+
+def test_alias_fsys() -> None:
+    """Test the lazy srctools.filesys.* aliases."""
+    from srctools.filesys import FileSystem, FileSystemChain, get_filesystem
+    assert srctools.FileSystem is FileSystem
+    assert srctools.FileSystemChain is FileSystemChain
+    assert srctools.get_filesystem is get_filesystem
+    assert 'FileSystem' in vars(srctools)
+
+
+def test_alias_vpk() -> None:
+    """Test the lazy srctools.VPK alias."""
+    from srctools.vpk import VPK
+    assert srctools.VPK is VPK
+    assert 'VPK' in vars(srctools)
+
+
+def test_alias_fgd() -> None:
+    """Test the lazy srctools.FGD alias."""
+    from srctools.fgd import FGD
+    assert srctools.FGD is FGD
+    assert 'FGD' in vars(srctools)
+
+
+def test_alias_const() -> None:
+    """Test the lazy srctools.GameID alias."""
+    from srctools.const import GameID
+    assert srctools.GameID is GameID
+    assert 'GameID' in vars(srctools)
+
+
+def test_alias_surfaceprop() -> None:
+    """Test the lazy srctools.surfaceprop.* aliases."""
+    from srctools.surfaceprop import SurfaceProp, SurfChar
+    assert srctools.SurfaceProp is SurfaceProp
+    assert srctools.SurfChar is SurfChar
+    assert 'SurfaceProp' in vars(srctools)
+    assert 'SurfChar' in vars(srctools)
+
+
+def test_alias_vtf() -> None:
+    """Test the lazy srctools.VTF alias."""
+    from srctools.vtf import VTF
+    assert srctools.VTF is VTF
+    assert 'VTF' in vars(srctools)

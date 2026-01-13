@@ -1,5 +1,6 @@
 """Test the resource functions implemented for specific entities."""
-from typing import Dict, Iterable, List, Mapping, Union
+from typing import Union
+from collections.abc import Iterable, Mapping
 from operator import itemgetter
 
 import pytest
@@ -176,6 +177,14 @@ def test_func_breakable_materials() -> None:
     )
     check_entity(
         *BREAKABLE,
+        # Custom model, bypasses presets.
+        Resource('CustomChunkDef', FileType.BREAKABLE_CHUNK),
+        classname='func_breakable',
+        material=1,
+        gibmodel='CustomChunkDef',
+    )
+    check_entity(
+        *BREAKABLE,
         # Not sure which is generated, so specify both.
         Resource('ConcreteChunks', FileType.BREAKABLE_CHUNK),
         Resource('CeilingTile', FileType.BREAKABLE_CHUNK),
@@ -262,6 +271,13 @@ def test_func_breakable_surf() -> None:
         classname='func_breakable_surf',
         material=5,
         surfacetype=1,
+    )
+    check_entity(
+        *BREAKABLE,
+        Resource.mdl("models/brokenglass_piece.mdl"),
+        classname='func_breakable_surf',
+        material=5,
+        surfacetype=10,  # Invalid, but no crash.
     )
 
 
@@ -453,6 +469,19 @@ def test_env_headcrabcanister() -> None:
             SF_NO_IMPACT_EFFECTS | SF_START_IMPACTED
         ),
     )
+    check_entity(
+        *common,
+        Resource.mdl("models/props_combine/headcrabcannister01b.mdl"),
+        Resource.snd("HeadcrabCanister.AfterLanding"),
+        Resource.snd("HeadcrabCanister.Open"),
+        # Invalid headcrab, don't include anything, but don't crash.
+        classname='env_headcrabcanister',
+        headcrabtype=30,
+        spawnflags=(
+            SF_NO_IMPACT_SOUND | SF_NO_LAUNCH_SOUND |
+            SF_NO_IMPACT_EFFECTS | SF_START_IMPACTED
+        ),
+    )
     # Without no_impact_sound, we play those.
     check_entity(
         Resource.mat("materials/sprites/smoke.vmt"),
@@ -514,9 +543,47 @@ def test_env_headcrabcanister() -> None:
     )
 
 
-@pytest.mark.xfail
 def test_env_shooter() -> None:
-    raise NotImplementedError
+    check_entity(
+        classname='env_shooter',
+        shootsounds=-1,  # Default and also out of bounds.
+    )
+    check_entity(
+        Resource.snd('Breakable.MatGlass'),
+        Resource.mat('some_gib.vmt'),
+        classname='env_shooter',
+        shootmodel='some_gib.vmt',
+        shootsounds=0,
+    )
+    check_entity(
+        Resource.snd('Breakable.MatWood'),
+        Resource.mdl('skull.mdl', skinset=0),
+        classname='env_shooter',
+        shootmodel='skull.mdl',
+        shootsounds=1,
+    )
+    check_entity(
+        Resource.snd('Breakable.MatMetal'),
+        Resource.mdl('skull.mdl', skinset=4),
+        classname='env_shooter',
+        shootmodel='skull.mdl',
+        skin=4,
+        shootsounds=2,
+    )
+    check_entity(
+        Resource.snd('Breakable.MatFlesh'),
+        Resource.mdl('skull.mdl', skinset=0),
+        classname='env_shooter',
+        shootmodel='skull.mdl',
+        shootsounds=3,
+    )
+    check_entity(
+        Resource.snd('Breakable.MatConcrete'),
+        Resource.mdl('skull.mdl', skinset=0),
+        classname='env_shooter',
+        shootmodel='skull.mdl',
+        shootsounds=4,
+    )
 
 
 def test_env_smokestack() -> None:
@@ -579,6 +646,12 @@ def test_env_smokestack() -> None:
         filesys__=fsys_partial,
         tags__=['hl2', 'episodic'],
     )
+    # Blank material = no behaviour.
+    check_entity(
+        Resource.mat('materials/particle/SmokeStack.vmt'),
+        classname='env_smokestack',
+        tags__=['hl2', 'episodic'],
+    )
 
 
 ammo_crate_models_hl2 = {
@@ -614,7 +687,7 @@ ammo_crate_models_mbase = {
     (ammo_crate_models_hl2, []),
     (ammo_crate_models_mbase, ['mapbase']),
 ], ids=['hl2', 'mapbase'])
-def test_item_ammo_crate(ammo: Dict[int, str], tags: List[str]) -> None:
+def test_item_ammo_crate(ammo: Mapping[int, str], tags: list[str]) -> None:
     """Test ammo crate models."""
     for i, ammo_mdl in ammo.items():
         check_entity(
@@ -625,6 +698,14 @@ def test_item_ammo_crate(ammo: Dict[int, str], tags: List[str]) -> None:
             ammotype=i,
             tags__=tags,
         )
+    # Invalid, but don't crash.
+    check_entity(
+        Resource.snd('AmmoCrate.Open'),
+        Resource.snd('AmmoCrate.Close'),
+        classname='item_ammo_crate',
+        ammotype=400,
+        tags__=tags,
+    )
     # Grenades include the entity.
     check_entity(
         Resource.snd('AmmoCrate.Open'),
@@ -748,26 +829,85 @@ def test_item_item_crate() -> None:
     )
 
 
+# Lots of sounds loaded by item_teamflag.
+TEAMFLAG_SND = [
+    'Announcer.SD_Event_CappedBlu',
+    'Announcer.SD_Event_CappedRed',
+    'Announcer.SD_Event_FlagNags',
+    'Announcer.SD_Event_FlagReturned',
+    'Announcer.SD_Event_OurTeamDroppedFlag',
+    'Announcer.SD_Event_OurTeamHasFlag',
+    'Announcer.SD_Event_TheirTeamDroppedFlag',
+    'Announcer.SD_Event_TheirTeamHasFlag',
+    'Announcer.SD_FlagReturned',
+    'Announcer.SD_OurTeamCapped',
+    'Announcer.SD_OurTeamDroppedFlag',
+    'Announcer.SD_OurTeamHasFlag',
+    'Announcer.SD_TheirTeamCapped',
+    'Announcer.SD_TheirTeamDroppedFlag',
+    'Announcer.SD_TheirTeamHasFlag',
+    'AttackDefend.Captured',
+    'CaptureFlag.FlagSpawn',
+    'CaptureFlag.TeamCapturedExcited',
+    'MVM.AttackDefend.EnemyReturned',
+    'Invade.FlagReturned',
+    'Invade.TeamStolen',
+    'Resource.FlagSpawn',
+
+    # Many are SomeTeam.SomeAction, avoid writing out. Special cases above.
+    *[
+        f'{team}.{action}'
+        for team in ['AttackDefend', 'CaptureFlag', 'RD']
+        for action in ['TeamReturned', 'EnemyReturned', 'TeamStolen']
+    ],
+    *[
+        f'{team}.{action}'
+        for team in ['AttackDefend', 'CaptureFlag', 'Invade', 'RD']
+        for action in ['TeamCaptured', 'TeamDropped']
+    ],
+    *[
+        f'{team}.{action}'
+        for team in ['AttackDefend', 'CaptureFlag', 'Invade', 'MVM.AttackDefend', 'RD']
+        for action in ['EnemyCaptured', 'EnemyDropped', 'EnemyStolen']
+    ],
+]
+
+
 def test_item_teamflag() -> None:
-    check_entity(classname='item_teamflag')
+    res_common = [
+        Resource.mdl('models/flag/briefcase.mdl'),
+        Resource.part('player_intel_papertrail'),
+        *map(Resource.snd, TEAMFLAG_SND)
+    ]
     check_entity(
+        *res_common,
         Resource.mat('materials/vgui/flags/my_flag_red.vmt'),
         Resource.mat('materials/vgui/flags/my_flag_blue.vmt'),
         Resource.mat('materials/effects/trail/the_trail_red.vmt'),
-        Resource.mat('materials/effects/trail/the_trail_blue.vmt'),
+        Resource.mat('materials/effects/trail/the_trail_blu.vmt'),
         classname='item_teamflag',
         flag_icon='flags/my_flag',
         flag_trail='trail/the_trail',
     )
     # Test putting in parent folders.
     check_entity(
+        *res_common,
         Resource.mat('materials/not_vgui/my_flag_red.vmt'),
         Resource.mat('materials/not_vgui/my_flag_blue.vmt'),
         Resource.mat('materials/non_effects/the_trail_red.vmt'),
-        Resource.mat('materials/non_effects/the_trail_blue.vmt'),
+        Resource.mat('materials/non_effects/the_trail_blu.vmt'),
         classname='item_teamflag',
         flag_icon='../not_vgui/my_flag',
         flag_trail='../non_effects/the_trail',
+    )
+    # Test missing KVs -> defaults.
+    check_entity(
+        *res_common,
+        Resource.mat('materials/hud/objectives_flagpanel_carried_red.vmt'),
+        Resource.mat('materials/hud/objectives_flagpanel_carried_blue.vmt'),
+        Resource.mat('materials/effects/flagtrail_red.vmt'),
+        Resource.mat('materials/effects/flagtrail_blu.vmt'),
+        classname='item_teamflag',
     )
 
 
@@ -779,6 +919,10 @@ def test_item_healthkit() -> None:
         Resource.mdl('models/items/healthkit.mdl'),
         classname='item_healthkit',
         tags__=['hl2'],
+    )
+    check_entity(
+        classname='item_healthkit',
+        tags__=TAGS_EZ2,  # No variant, include no model.
     )
     check_entity(
         Resource.snd('HealthKit.Touch'),
@@ -913,6 +1057,11 @@ def test_item_battery() -> None:
         Resource.mdl('models/items/battery.mdl'),
         classname='item_battery',
         tags__=['hl2'],
+    )
+    check_entity(
+        Resource.snd('ItemBattery.Touch'),
+        classname='item_battery',
+        tags__=TAGS_EZ2,  # No variant, include no model.
     )
     check_entity(
         Resource.snd('ItemBattery.Touch'),

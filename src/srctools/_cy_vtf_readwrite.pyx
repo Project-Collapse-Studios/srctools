@@ -1,10 +1,16 @@
 # cython: language_level=3, boundscheck=False, wraparound=False
 """Functions for reading/writing VTF data."""
-from cpython.bytes cimport PyBytes_FromStringAndSize
 from cython.parallel cimport parallel, prange
 from libc.stdint cimport uint8_t as byte, uint_fast8_t as fastbyte, uint_fast16_t
-from libc.stdio cimport snprintf
 from libc.string cimport memcpy, memset, strcmp
+
+from .pythoncapi_compat cimport (
+    PyBytesWriter, PyBytesWriter_GetData, PyBytesWriter_GetSize,
+    PyBytesWriter_Discard, PyBytesWriter_Create, PyBytesWriter_FinishWithSize,
+    PyBytesWriter_Finish, PyBytesWriter_FinishWithPointer,
+    PyBytesWriter_Resize, PyBytesWriter_Grow, PyBytesWriter_GrowAndUpdatePointer,
+    PyBytesWriter_WriteBytes, PyBytesWriter_Format
+)
 
 
 LIBSQUISH_LICENSE = """\
@@ -76,40 +82,38 @@ def ppm_convert(const byte[::1] pixels, uint width, uint height, tuple bg or Non
     """Convert a frame into a PPM-format bytestring, for passing to tkinter."""
     cdef float r, g, b
     cdef float a, inv_a
-    cdef Py_ssize_t off
-    cdef Py_ssize_t size = 3 * width * height
+    cdef Py_ssize_t off, header_size
+    cdef PyBytesWriter* writer = PyBytesWriter_Create(0)
+    cdef char * buffer
+    try:
+        # 3 * width * height
+        PyBytesWriter_Format(writer, b'P6 %u %u 255\n', width, height)
+        header_size = PyBytesWriter_GetSize(writer)
+        PyBytesWriter_Grow(writer, 3 * width * height)
+        buffer = <char *>PyBytesWriter_GetData(writer)
 
-    if size == 0:  # snprintf() wants to write a null terminator
-        size = 1
+        if bg is not None:
+            if len(bg) != 3:
+                raise ValueError('Background must be a 3-tuple!')
+            r = bg[0]
+            g = bg[1]
+            b = bg[2]
+            for off in prange(width * height, nogil=True, schedule='static'):
+                a = pixels[4 * off + 3] / <float>255.0
+                inv_a = <float>1.0 - a
+                buffer[header_size + 3*off + R] = <byte> (pixels[4*off] * a + inv_a * r)
+                buffer[header_size + 3*off + G] = <byte> (pixels[4*off + 1] * a + inv_a * g)
+                buffer[header_size + 3*off + B] = <byte> (pixels[4*off + 2] * a + inv_a * b)
+        else:
+            for off in prange(width * height, nogil=True, schedule='static'):
+                buffer[header_size + 3*off + R] = pixels[4*off]
+                buffer[header_size + 3*off + G] = pixels[4*off + 1]
+                buffer[header_size + 3*off + B] = pixels[4*off + 2]
 
-    cdef const char * PPM_HEADER = b'P6 %u %u 255\n'
-    cdef Py_ssize_t header_size = snprintf(EMPTY_BUFFER, 0, PPM_HEADER, width, height)
-    assert header_size > 0, "Bad format string"
-    # Allocate an uninitialised bytes object, that we can write to it.
-    # That's allowed as long as we don't give anyone else access.
-    cdef bytes result = PyBytes_FromStringAndSize(NULL, size + header_size)
-    cdef byte *buffer = result
-
-    snprintf(<char *>buffer, header_size + 1, PPM_HEADER, width, height)
-    if bg is not None:
-        if len(bg) != 3:
-            raise ValueError('Background must be a 3-tuple!')
-        r = bg[0]
-        g = bg[1]
-        b = bg[2]
-        for off in prange(width * height, nogil=True, schedule='static'):
-            a = pixels[4 * off + 3] / <float>255.0
-            inv_a = <float>1.0 - a
-            buffer[header_size + 3*off + R] = <byte> (pixels[4*off] * a + inv_a * r)
-            buffer[header_size + 3*off + G] = <byte> (pixels[4*off + 1] * a + inv_a * g)
-            buffer[header_size + 3*off + B] = <byte> (pixels[4*off + 2] * a + inv_a * b)
-    else:
-        for off in prange(width * height, nogil=True, schedule='static'):
-            buffer[header_size + 3*off + R] = pixels[4*off]
-            buffer[header_size + 3*off + G] = pixels[4*off + 1]
-            buffer[header_size + 3*off + B] = pixels[4*off + 2]
-
-    return result
+        return PyBytesWriter_Finish(writer)
+    except:
+        PyBytesWriter_Discard(writer)
+        raise
 
 
 def alpha_flatten(const byte[::1] pixels, byte[::1] buffer, uint width, uint height, tuple bg or None):
@@ -850,22 +854,34 @@ FORMATS[26] = Format("UVLX8888", &size_8888, &load_copy, &save_copy)
 FORMATS[27] = Format("NONE", NULL, NULL, NULL)
 FORMATS[28] = Format("ATI1N", &size_ati1n, NULL, NULL)
 FORMATS[29] = Format("ATI2N", &size_ati2n, &load_ati2n, &save_ati2n)
+cdef object ImageFormats = None
 
 
 def init(formats: 'srctools.vtf.ImageFormats') -> None:
     """Verify that the Python enum matches our array of functions."""
+    global ImageFormats
     cdef size_t index
     cdef bytes name
     for fmt in formats:
         index = fmt.ind
-        assert 0 <= index < (sizeof(FORMATS) // sizeof(Format))
-        assert strcmp((<str ?>fmt.name).encode('ascii'), FORMATS[index].name) == 0, f'{fmt} != {FORMATS[index].name.decode("ascii")}'
+        if not (0 <= index < (sizeof(FORMATS) // sizeof(Format))):
+            raise AssertionError(f'Invalid index {index}')
+        if strcmp((<str ?>fmt.name).encode('ascii'), FORMATS[index].name) != 0:
+            raise AssertionError(f'{index}: {fmt} != {FORMATS[index].name.decode("ascii")}')
         if FORMATS[index].load != NULL or FORMATS[index].save != NULL:
-            assert FORMATS[index].size != NULL, FORMATS[index].name.decode("ascii")
+            if FORMATS[index].size == NULL:
+                # Must have a size function if the load or save function is present.
+                raise AssertionError(f'Null size for {FORMATS[index].name.decode("ascii")}')
+    ImageFormats = formats
 
 
 def load(object fmt: 'srctools.vtf.ImageFormats', byte[::1] pixels, const byte[::1] data, uint width, uint height) -> None:
     """Load pixels from data in the given format."""
+    if ImageFormats is None:
+        raise AssertionError('init() not called')
+    if type(fmt) is not ImageFormats:
+        raise TypeError('fmt must be an ImageFormats enum value.')
+
     cdef Py_ssize_t data_size = 4 * width * height
     if data_size != len(pixels):
         raise BufferError(f"Incorrect pixel array size. Expected {data_size} bytes, got {len(pixels)} bytes.")
@@ -887,6 +903,11 @@ def load(object fmt: 'srctools.vtf.ImageFormats', byte[::1] pixels, const byte[:
 
 
 def save(object fmt: 'srctools.vtf.ImageFormats', const byte[::1] pixels, byte[::1] data, uint width, uint height) -> None:
+    if ImageFormats is None:
+        raise AssertionError('init() not called')
+    if type(fmt) is not ImageFormats:
+        raise TypeError('fmt must be an ImageFormats enum value.')
+
     cdef Py_ssize_t data_size = 4 * width * height
     if data_size != len(pixels):
         raise BufferError(f"Incorrect pixel array size. Expected {data_size} bytes, got {len(pixels)} bytes.")

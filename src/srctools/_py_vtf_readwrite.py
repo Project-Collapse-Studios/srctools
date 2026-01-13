@@ -3,8 +3,9 @@
 # Wherever possible, use memoryview slicing to copy channels all in one go. This is much faster
 # than a loop.
 
-from typing import TYPE_CHECKING, NewType, Callable, Dict, Iterable, List, Optional, Tuple
-from typing_extensions import TypeAlias, Buffer
+from typing import TYPE_CHECKING, NewType, Optional, Union
+from typing_extensions import Buffer, TypeAlias
+from collections.abc import Callable, Iterable
 import array
 
 
@@ -19,11 +20,34 @@ RWView = NewType('RWView', ROView)
 Array: TypeAlias = 'array.array[int]'
 SaveFunc: TypeAlias = Callable[[Array, RWView, int, int], None]
 LoadFunc: TypeAlias = Callable[[Array, ROView, int, int], None]
-_SAVE: Dict[ImageFormats, SaveFunc] = {}
-_LOAD: Dict[ImageFormats, LoadFunc] = {}
+_SAVE: dict[ImageFormats, SaveFunc] = {}
+_LOAD: dict[ImageFormats, LoadFunc] = {}
 
 
-def ppm_convert(pixels: Array, width: int, height: int, bg: Optional[Tuple[int, int, int]]) -> bytes:
+def check_strided_copy() -> Union[Exception, bytearray, bool]:
+    """For some reason PyPy can't copy non-contiguous arrays via memoryview. In that case,
+    we have to copy the source when slicing. Check to see if such slicing is possible.
+
+    If not, stash the error to show in the test suite.
+    """
+    src = b'ABCD'
+    dest = bytearray(8)
+    try:
+        memoryview(dest)[0::4] = memoryview(src)[::2]
+    except BufferError as exc:
+        return exc
+    if dest == b'A\x00\x00\x00C\x00\x00\x00':
+        return True
+    else:
+        return dest
+
+
+STRIDE_COPY = check_strided_copy()
+CAN_STRIDE_COPY = STRIDE_COPY is True
+del check_strided_copy
+
+
+def ppm_convert(pixels: Array, width: int, height: int, bg: Optional[tuple[int, int, int]]) -> bytes:
     """Convert a frame into a PPM-format bytestring, for passing to tkinter.
 
     If bg is set, this is the background we composite into. Otherwise, we just strip the alpha.
@@ -33,7 +57,7 @@ def ppm_convert(pixels: Array, width: int, height: int, bg: Optional[Tuple[int, 
     pix_count = width * height
     buffer = bytearray(img_off + 3 * pix_count)
     # Memoryviews to avoid making temp objects.
-    view_src = memoryview(pixels)
+    view_src = memoryview(pixels) if CAN_STRIDE_COPY else pixels
     view_dest = memoryview(buffer)
 
     view_dest[0:img_off] = header
@@ -46,16 +70,21 @@ def ppm_convert(pixels: Array, width: int, height: int, bg: Optional[Tuple[int, 
             buffer[img_off + 3*offset] = int(pixels[4*offset + 0] * a + inv_a * r)
             buffer[img_off + 3*offset + 1] = int(pixels[4*offset + 1] * a + inv_a * g)
             buffer[img_off + 3*offset + 2] = int(pixels[4*offset + 2] * a + inv_a * b)
-    else:
+    elif CAN_STRIDE_COPY:
         # Copying in 3 slices means we can skip the loop over every pixel.
         view_dest[img_off:img_off + 4*pix_count:3] = view_src[::4]
         view_dest[img_off+1:img_off + 4*pix_count+1:3] = view_src[1::4]
         view_dest[img_off+2:img_off + 4*pix_count+2:3] = view_src[2::4]
+    else:
+        for offset in range(width * height):
+            buffer[img_off + 3*offset] = pixels[4*offset + 0]
+            buffer[img_off + 3*offset + 1] = pixels[4*offset + 1]
+            buffer[img_off + 3*offset + 2] = pixels[4*offset + 2]
 
     return bytes(buffer)
 
 
-def alpha_flatten(pixels: Array, buffer: bytearray, width: int, height: int, bg: Optional[Tuple[int, int, int]]) -> bytes:
+def alpha_flatten(pixels: Array, buffer: bytearray, width: int, height: int, bg: Optional[tuple[int, int, int]]) -> bytes:
     """Flatten the image down to RGB, by removing the alpha channel.
 
     If bg is set, this is the background we composite into. Otherwise we
@@ -71,12 +100,17 @@ def alpha_flatten(pixels: Array, buffer: bytearray, width: int, height: int, bg:
             buffer[3 * offset] = int(pixels[4 * offset + 0] * a + inv_a * r)
             buffer[3 * offset + 1] = int(pixels[4 * offset + 1] * a + inv_a * g)
             buffer[3 * offset + 2] = int(pixels[4 * offset + 2] * a + inv_a * b)
-    else:
+    elif CAN_STRIDE_COPY:
         view_src = memoryview(pixels)
         view_dest = memoryview(buffer)
         view_dest[0:4*pix_count:3] = view_src[::4]
         view_dest[1:4*pix_count+1:3] = view_src[1::4]
         view_dest[2:4*pix_count+2:3] = view_src[2::4]
+    else:
+        for offset in range(width * height):
+            buffer[3 * offset] = pixels[4 * offset + 0]
+            buffer[3 * offset + 1] = pixels[4 * offset + 1]
+            buffer[3 * offset + 2] = pixels[4 * offset + 2]
 
     return bytes(buffer)
 
@@ -89,7 +123,7 @@ def upsample(bits: int, data: int) -> int:
     return data | (data >> bits)
 
 
-def decomp565(a: int, b: int) -> Tuple[int, int, int]:
+def decomp565(a: int, b: int) -> tuple[int, int, int]:
     """Decompress 565-packed data into RGB triplets."""
     return (
         upsample(5, (a & 0b00011111) << 3),
@@ -98,7 +132,7 @@ def decomp565(a: int, b: int) -> Tuple[int, int, int]:
     )
 
 
-def compress565(r: int, g: int, b: int) -> Tuple[int, int]:
+def compress565(r: int, g: int, b: int) -> tuple[int, int]:
     """Compress an RGB triplet into 565-packed data."""
     # RRRRRGGG GGGBBBBB
     return (
@@ -219,7 +253,7 @@ def scale_down(
         raise ValueError(f"Unknown filter {filt}!")
 
 
-def saveload_rgba(mode: str) -> Tuple[LoadFunc, SaveFunc]:
+def saveload_rgba(mode: str) -> tuple[LoadFunc, SaveFunc]:
     """Make the RGB save and load functions."""
     r_off = mode.index('r')
     g_off = mode.index('g')
@@ -227,36 +261,65 @@ def saveload_rgba(mode: str) -> Tuple[LoadFunc, SaveFunc]:
     try:
         a_off = mode.index('a')
     except ValueError:
-        def loader_rgb(pixels: Array, data: ROView, width: int, height: int) -> None:
-            view_pix = memoryview(pixels)
-            view_pix[0::4] = data[r_off::3]
-            view_pix[1::4] = data[g_off::3]
-            view_pix[2::4] = data[b_off::3]
-            view_pix[3::4] = b'\xFF' * (width * height)
+        if CAN_STRIDE_COPY:
+            def loader_rgb(pixels: Array, data: ROView, width: int, height: int) -> None:
+                view_pix = memoryview(pixels)
+                view_pix[0::4] = data[r_off::3]
+                view_pix[1::4] = data[g_off::3]
+                view_pix[2::4] = data[b_off::3]
+                view_pix[3::4] = b'\xFF' * (width * height)
 
-        def saver_rgb(pixels: Array, data: RWView, width: int, height: int) -> None:
-            view_pix = memoryview(pixels)
-            data[r_off::3] = view_pix[0::4]
-            data[g_off::3] = view_pix[1::4]
-            data[b_off::3] = view_pix[2::4]
+            def saver_rgb(pixels: Array, data: RWView, width: int, height: int) -> None:
+                view_pix = memoryview(pixels)
+                data[r_off::3] = view_pix[0::4]
+                data[g_off::3] = view_pix[1::4]
+                data[b_off::3] = view_pix[2::4]
+        else:
+            def loader_rgb(pixels: Array, data: ROView, width: int, height: int) -> None:
+                for offset in range(width * height):
+                    pixels[4 * offset] = data[3 * offset + r_off]
+                    pixels[4 * offset + 1] = data[3 * offset + g_off]
+                    pixels[4 * offset + 2] = data[3 * offset + b_off]
+                    pixels[4 * offset + 3] = 0xFF
+
+            def saver_rgb(pixels: Array, data: RWView, width: int, height: int) -> None:
+                for offset in range(width * height):
+                    data[3 * offset + r_off] = pixels[4 * offset]
+                    data[3 * offset + g_off] = pixels[4 * offset + 1]
+                    data[3 * offset + b_off] = pixels[4 * offset + 2]
 
         loader_rgb.__name__ = 'load_' + mode
         saver_rgb.__name__ = 'save_' + mode
         return loader_rgb, saver_rgb
     else:
-        def loader_rgba(pixels: Array, data: ROView, width: int, height: int) -> None:
-            view_pix = memoryview(pixels)
-            view_pix[0::4] = data[r_off::4]
-            view_pix[1::4] = data[g_off::4]
-            view_pix[2::4] = data[b_off::4]
-            view_pix[3::4] = data[a_off::4]
+        if CAN_STRIDE_COPY:
+            def loader_rgba(pixels: Array, data: ROView, width: int, height: int) -> None:
+                view_pix = memoryview(pixels)
+                view_pix[0::4] = data[r_off::4]
+                view_pix[1::4] = data[g_off::4]
+                view_pix[2::4] = data[b_off::4]
+                view_pix[3::4] = data[a_off::4]
 
-        def saver_rgba(pixels: Array, data: RWView, width: int, height: int) -> None:
-            view_pix = memoryview(pixels)
-            data[r_off::4] = view_pix[0::4]
-            data[g_off::4] = view_pix[1::4]
-            data[b_off::4] = view_pix[2::4]
-            data[a_off::4] = view_pix[3::4]
+            def saver_rgba(pixels: Array, data: RWView, width: int, height: int) -> None:
+                view_pix = memoryview(pixels)
+                data[r_off::4] = view_pix[0::4]
+                data[g_off::4] = view_pix[1::4]
+                data[b_off::4] = view_pix[2::4]
+                data[a_off::4] = view_pix[3::4]
+        else:
+            def loader_rgba(pixels: Array, data: ROView, width: int, height: int) -> None:
+                for offset in range(width * height):
+                    pixels[4 * offset] = data[4 * offset + r_off]
+                    pixels[4 * offset + 1] = data[4 * offset + g_off]
+                    pixels[4 * offset + 2] = data[4 * offset + b_off]
+                    pixels[4 * offset + 3] = data[4 * offset + a_off]
+
+            def saver_rgba(pixels: Array, data: RWView, width: int, height: int) -> None:
+                for offset in range(width * height):
+                    data[4 * offset + r_off] = pixels[4 * offset]
+                    data[4 * offset + g_off] = pixels[4 * offset + 1]
+                    data[4 * offset + b_off] = pixels[4 * offset + 2]
+                    data[4 * offset + a_off] = pixels[4 * offset + 3]
 
         loader_rgba.__name__ = 'load_' + mode
         saver_rgba.__name__ = 'save_' + mode
@@ -279,22 +342,39 @@ load_uvlx8888, save_uvlx8888 = saveload_rgba('rgba')
 load_uvwq8888, save_uvwq8888 = saveload_rgba('rgba')
 
 
-def load_bgrx8888(pixels: Array, data: ROView, width: int, height: int) -> None:
-    """Strange - skip byte."""
-    view_pix = memoryview(pixels)
-    view_pix[0::4] = data[2::4]
-    view_pix[1::4] = data[1::4]
-    view_pix[2::4] = data[0::4]
-    view_pix[3::4] = b'\xFF' * (width * height)
+if CAN_STRIDE_COPY:
+    def load_bgrx8888(pixels: Array, data: ROView, width: int, height: int) -> None:
+        """Strange - skip byte."""
+        view_pix = memoryview(pixels)
+        view_pix[0::4] = data[2::4]
+        view_pix[1::4] = data[1::4]
+        view_pix[2::4] = data[0::4]
+        view_pix[3::4] = b'\xFF' * (width * height)
 
 
-def save_bgrx8888(pixels: Array, data: RWView, width: int, height: int) -> None:
-    """Strange - skip byte."""
-    view_pix = memoryview(pixels)
-    data[3::4] = b'\0' * (width * height)
-    data[2::4] = view_pix[0::4]
-    data[1::4] = view_pix[1::4]
-    data[0::4] = view_pix[2::4]
+    def save_bgrx8888(pixels: Array, data: RWView, width: int, height: int) -> None:
+        """Strange - skip byte."""
+        view_pix = memoryview(pixels)
+        data[3::4] = b'\0' * (width * height)
+        data[2::4] = view_pix[0::4]
+        data[1::4] = view_pix[1::4]
+        data[0::4] = view_pix[2::4]
+else:
+    def load_bgrx8888(pixels: Array, data: ROView, width: int, height: int) -> None:
+        """Strange - skip byte."""
+        for offset in range(width * height):
+            pixels[4 * offset] = data[4 * offset + 2]
+            pixels[4 * offset + 1] = data[4 * offset + 1]
+            pixels[4 * offset + 2] = data[4 * offset]
+            pixels[4 * offset + 3] = 0xFF
+
+    def save_bgrx8888(pixels: Array, data: RWView, width: int, height: int) -> None:
+        """Strange - skip byte."""
+        for offset in range(width * height):
+            data[4 * offset + 3] = 0
+            data[4 * offset + 2] = pixels[4 * offset + 0]
+            data[4 * offset + 1] = pixels[4 * offset + 1]
+            data[4 * offset] = pixels[4 * offset + 2]
 
 
 def load_rgb565(pixels: Array, data: ROView, width: int, height: int) -> None:
@@ -407,14 +487,23 @@ def save_bgrx5551(pixels: Array, data: RWView, width: int, height: int) -> None:
         data[2 * offset + 1] = ((r >> 1) & 0b01111100) | (g >> 6)
 
 
-def load_i8(pixels: Array, data: ROView, width: int, height: int) -> None:
-    """I8 format, R=G=B"""
-    view_pix = memoryview(pixels)
-    view_dat = memoryview(data)
-    view_pix[0::4] = view_dat
-    view_pix[1::4] = view_dat
-    view_pix[2::4] = view_dat
-    view_pix[3::4] = b'\xff' * (width * height)
+if CAN_STRIDE_COPY:
+    def load_i8(pixels: Array, data: ROView, width: int, height: int) -> None:
+        """I8 format, R=G=B"""
+        view_pix = memoryview(pixels)
+        view_dat = memoryview(data)
+        view_pix[0::4] = view_dat
+        view_pix[1::4] = view_dat
+        view_pix[2::4] = view_dat
+        view_pix[3::4] = b'\xff' * (width * height)
+else:
+    def load_i8(pixels: Array, data: ROView, width: int, height: int) -> None:
+        """I8 format, R=G=B"""
+        for offset in range(width * height):
+            pixels[4 * offset] = i = data[offset]
+            pixels[4 * offset + 1] = i
+            pixels[4 * offset + 2] = i
+            pixels[4 * offset + 3] = 0xFF
 
 
 def save_i8(pixels: Array, data: RWView, width: int, height: int) -> None:
@@ -427,23 +516,43 @@ def save_i8(pixels: Array, data: RWView, width: int, height: int) -> None:
         ) // 3
 
 
-def load_ia88(pixels: Array, data: ROView, width: int, height: int) -> None:
-    """I8 format, R=G=B + A"""
-    view_pix = memoryview(pixels)
-    view_dat = memoryview(data)
-    view_pix[0::4] = view_pix[1::4] = view_pix[2::4] = view_dat[0::2]
-    view_pix[3::4] = view_dat[1::2]
+if CAN_STRIDE_COPY:
+    def load_ia88(pixels: Array, data: ROView, width: int, height: int) -> None:
+        """I8 format, R=G=B + A"""
+        view_pix = memoryview(pixels)
+        view_dat = memoryview(data)
+        view_pix[0::4] = view_pix[1::4] = view_pix[2::4] = view_dat[0::2]
+        view_pix[3::4] = view_dat[1::2]
+
+    def save_ia88(pixels: Array, data: RWView, width: int, height: int) -> None:
+        """I8 format, R=G=B + A"""
+        for offset in range(width * height):
+            data[2 * offset] = (
+                pixels[4 * offset] +
+                pixels[4 * offset + 1] +
+                pixels[4 * offset + 2]
+            ) // 3
+        memoryview(data)[1::2] = memoryview(pixels)[3::4]
+else:
+    def load_ia88(pixels: Array, data: ROView, width: int, height: int) -> None:
+        """I8 format, R=G=B + A"""
+        for offset in range(width * height):
+            pixels[4 * offset] = i = data[2 * offset]
+            pixels[4 * offset + 1] = i
+            pixels[4 * offset + 2] = i
+            pixels[4 * offset + 3] = data[2 * offset + 1]
+
+    def save_ia88(pixels: Array, data: RWView, width: int, height: int) -> None:
+        """I8 format, R=G=B + A"""
+        for offset in range(width * height):
+            data[2 * offset] = (
+                pixels[4 * offset] +
+                pixels[4 * offset + 1] +
+                pixels[4 * offset + 2]
+            ) // 3
+            data[2 * offset + 1] = pixels[4 * offset + 3]
 
 
-def save_ia88(pixels: Array, data: RWView, width: int, height: int) -> None:
-    """I8 format, R=G=B + A"""
-    for offset in range(width * height):
-        data[2 * offset] = (
-            pixels[4 * offset] +
-            pixels[4 * offset + 1] +
-            pixels[4 * offset + 2]
-        ) // 3
-    memoryview(data)[1::2] = memoryview(pixels)[3::4]
 
 # ImageFormats.P8 is not implemented by Valve either.
 
@@ -455,24 +564,44 @@ def load_a8(pixels: Array, data: ROView, width: int, height: int) -> None:
     view_pix[3::4] = data
 
 
-def save_a8(pixels: Array, data: RWView, width: int, height: int) -> None:
-    """Single alpha bytes."""
-    data[:] = memoryview(pixels)[3::4]
+if CAN_STRIDE_COPY:
+    def save_a8(pixels: Array, data: RWView, width: int, height: int) -> None:
+        """Single alpha bytes."""
+        view_pix = memoryview(pixels)
+        data[:] = view_pix[3::4]
+else:
+    def save_a8(pixels: Array, data: RWView, width: int, height: int) -> None:
+        """Single alpha bytes."""
+        for offset in range(width * height):
+            data[offset] = pixels[4 * offset + 3]
 
 
-def load_uv88(pixels: Array, data: ROView, width: int, height: int) -> None:
-    """UV-only, which is mapped to RG."""
-    view_pix = memoryview(pixels)
-    view_pix[:] = b'\0\0\0\xFF' * (width * height)
-    view_pix[0::4] = data[0::2]
-    view_pix[1::4] = data[1::2]
+if CAN_STRIDE_COPY:
+    def load_uv88(pixels: Array, data: ROView, width: int, height: int) -> None:
+        """UV-only, which is mapped to RG."""
+        view_pix = memoryview(pixels)
+        view_pix[:] = b'\0\0\0\xFF' * (width * height)
+        view_dat = memoryview(data)
+        view_pix[0::4] = view_dat[0::2]
+        view_pix[1::4] = view_dat[1::2]
 
+    def save_uv88(pixels: Array, data: RWView, width: int, height: int) -> None:
+        """UV-only, which is mapped to RG."""
+        view_pix = memoryview(pixels)
+        data[0::2] = view_pix[0::4]
+        data[1::2] = view_pix[1::4]
+else:
+    def load_uv88(pixels: Array, data: ROView, width: int, height: int) -> None:
+        """UV-only, which is mapped to RG."""
+        for offset in range(width * height):
+            pixels[4 * offset] = data[2 * offset]
+            pixels[4 * offset + 1] = data[2 * offset + 1]
 
-def save_uv88(pixels: Array, data: RWView, width: int, height: int) -> None:
-    """UV-only, which is mapped to RG."""
-    view_pix = memoryview(pixels)
-    data[0::2] = view_pix[0::4]
-    data[1::2] = view_pix[1::4]
+    def save_uv88(pixels: Array, data: RWView, width: int, height: int) -> None:
+        """UV-only, which is mapped to RG."""
+        for offset in range(width * height):
+            data[2 * offset] = pixels[4 * offset]
+            data[2 * offset + 1] = pixels[4 * offset + 1]
 
 
 def load_rgb888_bluescreen(pixels: Array, data: ROView, width: int, height: int) -> None:
@@ -560,7 +689,7 @@ def load_dxt1_impl(
     data: ROView,
     width: int,
     height: int,
-    black_color: Tuple[int, int, int, int],
+    black_color: tuple[int, int, int, int],
 ) -> None:
     """Does the actual decompression."""
     if width < 4 or height < 4:
@@ -631,7 +760,7 @@ def load_dxt1_impl(
 def dxt_color_table(
     pixels: Array,
     data: ROView,
-    table: List[Tuple[int, int, int, int]],
+    table: list[tuple[int, int, int, int]],
     block_off: int,
     block_wid: int,
     block_x: int,
@@ -739,7 +868,7 @@ def load_dxt3(pixels: Array, data: ROView, width: int, height: int) -> None:
             c0r, c0g, c0b = decomp565(data[block_off + 8], data[block_off + 9])
             c1r, c1g, c1b = decomp565(data[block_off + 10], data[block_off + 11])
 
-            table: List[Tuple[int, int, int, int]] = [
+            table: list[tuple[int, int, int, int]] = [
                 (c0b, c0g, c0r, 255),
                 (c1b, c1g, c1r, 255),
                 (
@@ -796,7 +925,7 @@ def load_dxt5(pixels: Array, data: ROView, width: int, height: int) -> None:
             c0r, c0g, c0b = decomp565(data[block_off + 8], data[block_off + 9])
             c1r, c1g, c1b = decomp565(data[block_off + 10], data[block_off + 11])
 
-            table: List[Tuple[int, int, int, int]] = [
+            table: list[tuple[int, int, int, int]] = [
                 (c0b, c0g, c0r, 127),
                 (c1b, c1g, c1r, 127),
                 (

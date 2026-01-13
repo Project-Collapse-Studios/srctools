@@ -1,17 +1,16 @@
 """Parses material files."""
-from typing import (
-    Callable, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, TextIO,
-    Tuple, TypeVar, Union, overload,
-)
+from typing import Callable, Optional, TypeVar, Union, overload
+from collections.abc import Iterable, Iterator, Mapping, MutableMapping
 from enum import Enum
 import sys
 
 import attrs
 
-from srctools import EmptyMapping
-from srctools.filesys import FileSystem
-from srctools.keyvalues import Keyvalues
-from srctools.tokenizer import BARE_DISALLOWED, Token as Tok, Tokenizer as Tokenizer
+from .filesys import FileSystem
+from .keyvalues import Keyvalues
+from .tokenizer import BARE_DISALLOWED, Token as Tok, Tokenizer as Tokenizer
+from .types import FileWText
+from . import EmptyMapping
 
 
 class VarType(Enum):
@@ -63,7 +62,7 @@ class Variable:
 
 __all__ = ['VarType', 'Material', 'get_parm_type']
 ArgT = TypeVar('ArgT')
-_SHADER_PARAM_TYPES: Dict[str, VarType] = {}
+_SHADER_PARAM_TYPES: dict[str, VarType] = {}
 
 
 @overload
@@ -106,13 +105,13 @@ class Material(MutableMapping[str, str]):
     """
     shader: str
     """The name of the shader."""
-    proxies: List[Keyvalues]
+    proxies: list[Keyvalues]
     """
     List of Material Proxies defined for the material.
     Each is a tuple of the string name and a dict of keys-> values.
     "Empty" proxies are removed.
     """
-    blocks: List[Keyvalues]
+    blocks: list[Keyvalues]
     """Other sub-blocks inside the material definition. These are usually fallbacks or other similar definitions."""
 
     def __init__(
@@ -124,7 +123,7 @@ class Material(MutableMapping[str, str]):
     ) -> None:
         """Create a material."""
         self.shader = shader
-        self._params: Dict[str, Variable] = {}
+        self._params: dict[str, Variable] = {}
         self.blocks = list(blocks)
         self.proxies = list(proxies)
 
@@ -211,7 +210,7 @@ class Material(MutableMapping[str, str]):
         return mat
 
     @staticmethod
-    def _parse_proxies(tok: Tokenizer) -> Iterator[Tuple[str, Dict[str, str]]]:
+    def _parse_proxies(tok: Tokenizer) -> Iterator[tuple[str, dict[str, str]]]:
         # Parse the proxy block.
 
         for token, proxy_name in tok.skipping_newlines():
@@ -220,7 +219,7 @@ class Material(MutableMapping[str, str]):
             elif token is not Tok.STRING:
                 raise tok.error(token)
 
-            opts: Dict[str, str] = {}
+            opts: dict[str, str] = {}
 
             tok.expect(Tok.BRACE_OPEN)  # Start of proxy values.
 
@@ -283,7 +282,7 @@ class Material(MutableMapping[str, str]):
 
         raise tok.error('EOF without closed block!')
 
-    def export(self, f: TextIO) -> None:
+    def export(self, f: FileWText) -> None:
         """Write the material back to a file."""
         f.write(self.shader + '\n\t{\n')
         for param in self._params.values():
@@ -310,7 +309,7 @@ class Material(MutableMapping[str, str]):
         limit: int = 100,
         parent_func: Optional[Callable[[str], None]] = None,
     ) -> 'Material':
-        """If the material is a `Patch <https://developer.valvesoftware.com/wiki/Patch>` shader expand to the full material.
+        """If the material is a :vdc:`Patch` shader expand to the full material.
 
         :param fsys: This reads from the supplied filesystem as required.
         :param limit: If more than this many files are parsed, a RecursionError is raised.
@@ -386,8 +385,6 @@ class Material(MutableMapping[str, str]):
                         pass
                 elif always_add or prop.name in copy._params:
                     copy[prop.real_name] = prop.value
-                else:
-                    pass
         return copy
 
     def __iter__(self) -> Iterator[str]:

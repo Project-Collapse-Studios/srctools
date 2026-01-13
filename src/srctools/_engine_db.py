@@ -3,11 +3,10 @@
 This lists keyvalue/io types and names available for every entity classname.
 The dump does not contain help descriptions to keep the data small.
 """
-from typing import (
-    IO, TYPE_CHECKING, AbstractSet, Callable, Collection, Dict, Final, FrozenSet,
-    Iterable, List, Mapping, Optional, Set, Tuple, Union, Counter
-)
+from typing import TYPE_CHECKING, Final, Optional, Union
 from typing_extensions import TypeAlias
+from collections import Counter
+from collections.abc import Callable, Collection, Iterable, Mapping, Set as AbstractSet
 from enum import IntFlag
 from struct import Struct
 import copy
@@ -20,17 +19,17 @@ import warnings
 
 from .binformat import DeferredWrites
 from .const import FileType
-from .fgd import EntAttribute, FGD, EntityDef, EntityTypes, IODef, KVDef, Resource, ValueTypes
+from .types import FileR, FileRSeek, FileWBinary, FileWBinarySeek
+from .fgd import FGD, EntAttribute, EntityDef, EntityTypes, IODef, KVDef, Resource, ValueTypes
 
 
 from .fgd import _EngineDBProto, _EntityView  # isort: split # noqa
 
 
-__all__ = [
-    'serialise', 'unserialise',
-]
+__all__ = ['serialise', 'unserialise']
 
 _fmt_8bit: Final = Struct('<B')
+_fmt_dbl_8bit: Final = Struct('<BB')
 _fmt_16bit: Final = Struct('<H')
 _fmt_32bit: Final = Struct('<I')
 _fmt_double: Final = Struct('<d')
@@ -40,8 +39,8 @@ _fmt_block_pos: Final = Struct('<IH')
 
 
 # Version number for the format.
-BIN_FORMAT_VERSION: Final = 9
-TAG_EMPTY: Final[FrozenSet[str]] = frozenset()  # This is a singleton.
+BIN_FORMAT_VERSION: Final = 10
+TAG_EMPTY: Final[frozenset[str]] = frozenset()  # This is a singleton.
 # Soft limit on the number of bytes for each block, needs tuning.
 MAX_BLOCK_SIZE: Final = 2048
 # When writing arrays of strings, it's much more efficient to read the whole thing, decode then
@@ -138,10 +137,13 @@ FILE_TYPE_ORDER = [
     FileType.MODEL,
     FileType.BREAKABLE_CHUNK,
     FileType.WEAPON_SCRIPT,
+    FileType.RAW_SOUND,
+    FileType.SOUNDSCAPE_NAME,
+    FileType.SOUNDSCAPE_FILE,
 ]
 
 # Entity types -> bits used
-ENTITY_TYPE_2_FLAG: Dict[EntityTypes, EntFlags] = {
+ENTITY_TYPE_2_FLAG: dict[EntityTypes, EntFlags] = {
     kind: EntFlags['TYPE_' + kind.name]
     for kind in EntityTypes
 }
@@ -154,15 +156,19 @@ assert set(FILE_TYPE_ORDER) == set(FileType), \
     "Missing file types: " + repr(set(FileType) - set(FILE_TYPE_ORDER))
 
 # Can only store this many in the bytes.
-assert len(VALUE_TYPE_ORDER) < 127, "Too many values."
+assert len(VALUE_TYPE_ORDER) < 256, "Too many values."
 assert len(FILE_TYPE_ORDER) < 127, "Too many file types."
 
 VALUE_TYPE_INDEX = {val: ind for (ind, val) in enumerate(VALUE_TYPE_ORDER)}
 FILE_TYPE_INDEX = {val: ind for (ind, val) in enumerate(FILE_TYPE_ORDER)}
 ENTITY_FLAG_2_TYPE = {flag: kind for (kind, flag) in ENTITY_TYPE_2_FLAG.items()}
 
+KV_FLAG_READONLY = 0b001
+KV_FLAG_EDITOR = 0b010
+KV_FLAG_REPORT = 0b100
 
-def make_lookup(file: IO[bytes], inv_list: List[str]) -> Callable[[], str]:
+
+def make_lookup(file: FileR[bytes], inv_list: list[str]) -> Callable[[], str]:
     """Return a function that reads the index from the file, and returns the string it matches."""
     def lookup() -> str:
         """Perform the lookup."""
@@ -196,13 +202,13 @@ class BinStrDict:
     Each unique string is assigned a 2-byte index into the list.
     """
     def __init__(self, database: Iterable[str], base: Optional['BinStrDict']) -> None:
-        self._dict: Dict[str, int] = {
+        self._dict: dict[str, int] = {
             name: ind for ind, name
             in enumerate(sorted(database))
         }
         # If no base dict, this is for CBaseEntity, so set it to the real dict,
         # so __call__() won't add SHARED_STRINGS to the index.
-        self.base_dict: Dict[str, int] = base._dict if base is not None else self._dict
+        self.base_dict: dict[str, int] = base._dict if base is not None else self._dict
         if len(self._dict) + len(self.base_dict) >= (1 << 16):
             raise ValueError("Too many items in dictionary!")
 
@@ -216,7 +222,7 @@ class BinStrDict:
         else:
             return _fmt_16bit.pack(SHARED_STRINGS + self._dict[string])
 
-    def serialise(self, file: IO[bytes]) -> None:
+    def serialise(self, file: FileWBinary) -> None:
         """Convert this to a stream of bytes."""
         inv_list = [''] * len(self._dict)
         for txt, ind in self._dict.items():
@@ -231,7 +237,7 @@ class BinStrDict:
         file.write(data)
 
     @classmethod
-    def unserialise(cls, file: IO[bytes], base: List[str]) -> Tuple[List[str], Callable[[], str]]:
+    def unserialise(cls, file: FileR[bytes], base: list[str]) -> tuple[list[str], Callable[[], str]]:
         """Read the dictionary from a file.
 
         This returns the dict, and a function which reads
@@ -244,7 +250,7 @@ class BinStrDict:
         return inv_list, make_lookup(file, base + inv_list)
 
     @staticmethod
-    def read_tags(file: IO[bytes], from_dict: Callable[[], str]) -> FrozenSet[str]:
+    def read_tags(file: FileR[bytes], from_dict: Callable[[], str]) -> frozenset[str]:
         """Pull tags from a BinStrDict."""
         [size] = file.read(1)
         return frozenset({
@@ -254,7 +260,7 @@ class BinStrDict:
 
     @staticmethod
     def write_tags(
-        file: IO[bytes],
+        file: FileWBinary,
         dic: 'BinStrSerialise',
         tags: Collection[str],
     ) -> None:
@@ -268,9 +274,9 @@ class EngineDB(_EngineDBProto):
     """Unserialised database, which will be parsed progressively as required."""
     def __init__(
         self,
-        ent_map: Dict[str, Union[EntityDef, int]],
-        base_strings: List[str],
-        unparsed: List[Tuple[Iterable[str], bytes]],
+        ent_map: dict[str, Union[EntityDef, int]],
+        base_strings: list[str],
+        unparsed: list[tuple[Iterable[str], bytes]],
     ) -> None:
         self.ent_map = ent_map
         self.unparsed = unparsed
@@ -348,21 +354,23 @@ class EngineDB(_EngineDBProto):
         return copy.deepcopy(self.fgd)
 
 
-def kv_serialise(kvdef: KVDef, file: IO[bytes], str_dict: BinStrSerialise) -> None:
+def kv_serialise(kvdef: KVDef, file: FileWBinary, str_dict: BinStrSerialise) -> None:
     """Write keyvalues to the binary file."""
     file.write(str_dict(kvdef.name))
     file.write(str_dict(kvdef.disp_name))
-    value_type = VALUE_TYPE_INDEX[kvdef.type]
-    # Use the high bit to store this inside here as well.
-    if kvdef.readonly:
-        value_type |= 128
-    file.write(_fmt_8bit.pack(value_type))
+    file.write(_fmt_dbl_8bit.pack(
+        VALUE_TYPE_INDEX[kvdef.type],
+
+        KV_FLAG_REPORT * kvdef.reportable |
+        KV_FLAG_EDITOR * kvdef.editor_only |
+        KV_FLAG_READONLY * kvdef.readonly
+    ))
 
     # Spawnflags have integer names and defaults,
     # choices has string values and no default.
     if kvdef.type is ValueTypes.SPAWNFLAGS:
         file.write(_fmt_8bit.pack(len(kvdef.flags_list)))
-        # spawnflags go up to at least 1<<23.
+        # spawnflags are a 32-bit int in-game, 64 in Hammer. So 128 is more than sufficient.
         for mask, name, default, tags in kvdef.flags_list:
             if tags:
                 raise ValueError('Cannot use tags!')
@@ -376,24 +384,23 @@ def kv_serialise(kvdef: KVDef, file: IO[bytes], str_dict: BinStrSerialise) -> No
             file.write(str_dict(name))
         return  # Spawnflags doesn't need to write a default.
 
-    file.write(str_dict(kvdef.default or ''))
+    file.write(str_dict(kvdef.default))
 
     if kvdef.type is ValueTypes.CHOICES:
         raise ValueError('CHOICES may not be used for keyvalues!')
 
 
 def kv_unserialise(
-    file: IO[bytes],
+    file: FileR[bytes],
     from_dict: Callable[[], str],
 ) -> KVDef:
     """Recover a KeyValue from a binary file."""
     name = from_dict()
     disp_name = from_dict()
-    [value_ind] = file.read(1)
-    readonly = value_ind & 128 != 0
-    value_type = VALUE_TYPE_ORDER[value_ind & 127]
+    [value_ind, kv_flags] = file.read(2)
+    value_type = VALUE_TYPE_ORDER[value_ind]
 
-    val_list: Optional[List[Tuple[int, str, bool, FrozenSet[str]]]]
+    val_list: Optional[list[tuple[int, str, bool, frozenset[str]]]]
 
     if value_type is ValueTypes.SPAWNFLAGS:
         default = ''  # No default for this type.
@@ -420,19 +427,20 @@ def kv_unserialise(
     kv.default = default
     kv.desc = ''
     kv.val_list = val_list
-    kv.readonly = readonly
-    kv.reportable = False
+    kv.readonly = KV_FLAG_READONLY & kv_flags != 0
+    kv.reportable = KV_FLAG_REPORT & kv_flags != 0
+    kv.editor_only = KV_FLAG_EDITOR & kv_flags != 0
     return kv
 
 
-def iodef_serialise(iodef: IODef, file: IO[bytes], dic: BinStrSerialise) -> None:
+def iodef_serialise(iodef: IODef, file: FileWBinary, dic: BinStrSerialise) -> None:
     """Write an IO def the binary file."""
     file.write(dic(iodef.name))
     file.write(_fmt_8bit.pack(VALUE_TYPE_INDEX[iodef.type]))
 
 
 def iodef_unserialise(
-    file: IO[bytes],
+    file: FileR[bytes],
     from_dict: Callable[[], str],
 ) -> IODef:
     """Recover an IODef from a binary file."""
@@ -445,7 +453,7 @@ def iodef_unserialise(
     return iodef
 
 
-def ent_serialise(ent: EntityDef, file: IO[bytes], str_dict: BinStrSerialise) -> None:
+def ent_serialise(ent: EntityDef, file: FileWBinary, str_dict: BinStrSerialise) -> None:
     """Write an entity to the binary file."""
     flags = ENTITY_TYPE_2_FLAG[ent.type]
     if ent.is_alias:
@@ -476,7 +484,7 @@ def ent_serialise(ent: EntityDef, file: IO[bytes], str_dict: BinStrSerialise) ->
 
             # We only support untagged things.
             if len(tag_map) == 1:
-                tags: FrozenSet[str]
+                tags: frozenset[str]
                 value: EntAttribute
                 [(tags, value)] = tag_map.items()
                 if not tags:
@@ -507,7 +515,7 @@ def ent_serialise(ent: EntityDef, file: IO[bytes], str_dict: BinStrSerialise) ->
 
 
 def ent_unserialise(
-    file: IO[bytes],
+    file: FileR[bytes],
     classname: str,
     from_dict: Callable[[], str],
 ) -> EntityDef:
@@ -577,15 +585,18 @@ def ent_unserialise(
     return ent
 
 
-def compute_ent_strings(ents: Iterable[EntityDef]) -> Tuple[Mapping[EntityDef, AbstractSet[str]], Mapping[EntityDef, int]]:
+def compute_ent_strings(ents: Iterable[EntityDef]) -> tuple[
+    Mapping[EntityDef, set[str]],
+    Mapping[EntityDef, int]
+]:
     """Compute the strings each entity needs for unserialisation.
 
     This is done by serialising to a dummy file, noting the strings written.
     """
     dummy_file = io.BytesIO()
-    ent_strings: Set[str]
-    ent_to_string: Dict[EntityDef, Set[str]] = {}
-    ent_to_size: Dict[EntityDef, int] = {}
+    ent_strings: set[str]
+    ent_to_string: dict[EntityDef, set[str]] = {}
+    ent_to_size: dict[EntityDef, int] = {}
 
     def record_strings(string: str) -> bytes:
         """Store the strings written for this entity."""
@@ -626,18 +637,18 @@ def compute_ent_strings(ents: Iterable[EntityDef]) -> Tuple[Mapping[EntityDef, A
 
 
 def build_blocks(
-    all_ents: List[EntityDef],
+    all_ents: list[EntityDef],
     ent_to_string: Mapping[EntityDef, AbstractSet[str]],
     ent_to_size: Mapping[EntityDef, int],
-    overlaps: Iterable[Tuple[EntityDef, EntityDef, int]],
-) -> List[Tuple[List[EntityDef], Set[str]]]:
+    overlaps: Iterable[tuple[EntityDef, EntityDef, int]],
+) -> list[tuple[list[EntityDef], set[str]]]:
     """Group entities into the blocks to use."""
 
     class BuiltBlock:
         """Used when serialising, the data."""
         def __init__(self) -> None:
-            self.ents: List[EntityDef] = []
-            self.stringdb: Set[str] = set()
+            self.ents: list[EntityDef] = []
+            self.stringdb: set[str] = set()
             self.bytesize: int = 0
 
         def add_ent(self, ent: EntityDef) -> None:
@@ -649,9 +660,9 @@ def build_blocks(
             ent_to_block[ent] = self  # noqa: F821
             todo.discard(ent)  # noqa: F821
 
-    ent_to_block: Dict[EntityDef, BuiltBlock] = {}
+    ent_to_block: dict[EntityDef, BuiltBlock] = {}
     overflow_block = BuiltBlock()
-    all_blocks: List[BuiltBlock] = [overflow_block]
+    all_blocks: list[BuiltBlock] = [overflow_block]
     todo = set(all_ents)
 
     for ent1, ent2, overlap_size in overlaps:
@@ -713,14 +724,14 @@ def build_blocks(
     ]
 
 
-def serialise(fgd: FGD, file: IO[bytes]) -> None:
+def serialise(fgd: FGD, file: FileWBinarySeek) -> None:
     """Write the FGD into a compacted binary format.
 
     This is expected to be in engine format - _CBaseEntity_ is present, with all others based on it,
     and no other base entities.
     """
     CBaseEntity = fgd.entities.pop('_cbaseentity_')
-    all_ents: List[EntityDef] = list(fgd)
+    all_ents: list[EntityDef] = list(fgd)
 
     print('Computing string sizes...')
     # We need the database for CBaseEntity, but not to include it with anything else.
@@ -747,10 +758,7 @@ def serialise(fgd: FGD, file: IO[bytes]) -> None:
     # Finally, we can serialise the file.
 
     # Start of file - format version, FGD min/max, number of entities.
-    file.write(b'FGD' + _fmt_header.pack(
-        BIN_FORMAT_VERSION,
-        len(blocks),
-    ))
+    file.write(b'FGD' + _fmt_header.pack(BIN_FORMAT_VERSION, len(blocks)))
 
     deferred = DeferredWrites(file)
     for block_ents, block_stringdb in blocks:
@@ -781,7 +789,7 @@ def serialise(fgd: FGD, file: IO[bytes]) -> None:
     deferred.write()
 
 
-def unserialise(file: IO[bytes]) -> _EngineDBProto:
+def unserialise(file: FileRSeek[bytes]) -> _EngineDBProto:
     """Unpack data from engine_make_dump() to return the original data."""
 
     if file.read(3) != b'FGD':
@@ -790,12 +798,12 @@ def unserialise(file: IO[bytes]) -> _EngineDBProto:
     [format_version, block_count] = _fmt_header.unpack(file.read(_fmt_header.size))
 
     if format_version != BIN_FORMAT_VERSION:
-        raise TypeError(f'Unknown format version "{format_version}"!')
+        raise TypeError(f'Unknown format version {format_version}, expected {BIN_FORMAT_VERSION}!')
 
-    block_classnames: List[List[str]] = []
-    ent_map: Dict[str, Union[EntityDef, int]] = {}
-    unparsed: List[Tuple[Iterable[str], bytes]] = []
-    positions: List[Tuple[List[str], int, int]] = []
+    block_classnames: list[list[str]] = []
+    ent_map: dict[str, Union[EntityDef, int]] = {}
+    unparsed: list[tuple[Iterable[str], bytes]] = []
+    positions: list[tuple[list[str], int, int]] = []
 
     for block_id in range(block_count):
         [cls_size] = _fmt_16bit.unpack(file.read(2))

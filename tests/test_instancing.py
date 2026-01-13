@@ -1,11 +1,10 @@
 """Test handling of instance collapsing."""
-from typing import cast
-
 import pytest
 
-from srctools import VMF, instancing
 from srctools.fgd import ValueTypes
 from srctools.math import Angle, FrozenMatrix, FrozenVec, Matrix, Vec, format_float
+from srctools.vmf import VMF
+from srctools import instancing
 
 
 MAT_CCW = FrozenMatrix.from_yaw(270)
@@ -111,7 +110,7 @@ def test_kv_sides() -> None:
     inst = instancing.Instance('test_inst', '', Vec(), Matrix())
     vmf = VMF()
     # Pretend we had collapsed brushes with these values.
-    cast(dict, inst.face_ids).update({45: 68, 12: 12, 85: 92, 86: 93})
+    inst.face_ids.update({45: 68, 12: 12, 85: 92, 86: 93})
 
     # Invalid ints and missing keys are ignored.
     assert inst.fixup_key(vmf, [], ValueTypes.SIDE_LIST, '45 ardvark 6 12') == '12 68'
@@ -130,7 +129,7 @@ def test_kv_errors() -> None:
         inst.fixup_key(vmf, [], ValueTypes.ANGLE_NEG_PITCH, '45')
     with pytest.raises(ValueError, match='instance as a whole'):
         inst.fixup_key(vmf, [], ValueTypes.EXT_ANGLE_PITCH, '45')
-    with pytest.raises(ValueError, match='is not meaningful.+swapped with another'):
+    with pytest.raises(ValueError, match=r'is not meaningful.+swapped with another'):
         inst.fixup_key(vmf, [], ValueTypes.CHOICES, 'test')
         
         
@@ -247,7 +246,7 @@ def test_node_ids(kind: ValueTypes) -> None:
     # Mark these IDs as in use.
     vmf.node_id.get_id(1)
     vmf.node_id.get_id(4)
-    cast(dict, inst.node_ids).update({
+    inst.node_ids.update({
         3: vmf.node_id.get_id(3),
         72: vmf.node_id.get_id(128),
         73: vmf.node_id.get_id(129),

@@ -1,34 +1,129 @@
 """Reads and writes Soundscripts."""
-from typing import IO, Callable, Dict, List, Optional, TextIO, Tuple, TypeVar, Union
-from enum import Enum
+from typing import Callable, Optional, TypeVar, Union
+from typing_extensions import TypeAlias
+
+from collections.abc import Mapping
+import enum
 import struct
+import re
 
 import attrs
 
-from srctools import conv_float
-from srctools.keyvalues import Keyvalues, NoKeyError
+from . import conv_float, conv_int
+from .math import format_float
+from .keyvalues import Keyvalues, NoKeyError
+from .types import FileRSeek, FileWText
 
 
 __all__ = [
-    'SND_CHARS', 'Pitch', 'VOL_NORM', 'Channel', 'Level',
-    'Sound', 'wav_is_looped',
+    'SoundChars', 'Pitch', 'Channel', 'Level', 'Volume', 'VOL_NORM',
+    'Sound', 'wav_is_looped', 'parse_split_float', 'split_float', 'join_float',
+    'SND_CHARS', 'Interval', 'LevelInterval',
 ]
 
-# All the prefixes wavs can have.
+EnumT = TypeVar('EnumT')
+Interval: TypeAlias = tuple[Union[float, EnumT], Union[float, EnumT]]
+LevelInterval: TypeAlias = tuple[Union[int, 'Level'], Union[int, 'Level']]
+
+
+#: Possible sound characters.
+#: deprecated: Use SoundChars instead.
 SND_CHARS = '*@#<>^)}$!?'
 
 
-class Pitch(float, Enum):
+class SoundChars(enum.Flag):
+    """Flags to represent sound characters which can be added to the start of sound filenames.
+
+    Despite comments in the SDK, more than 2 are permitted simultaneously.
+    To re-assemble into a set of characters, call :py:obj:`str`.
+    """
+    none = 0  #: A filename with no characters included.
+
+    #: Stream the sound from disc, discarded afterwards. Use for one-off dialogue files or
+    # music, to not keep them in memory.
+    stream = enum.auto()
+    user_vox = enum.auto()  #: Marks player voice chat data, shouldn't ever be used.
+    sentence = enum.auto()  #: Dialog from the NPC sentence system.
+    dry_mix = enum.auto()  #: DSP FX is bypassed for this sound.
+    doppler = enum.auto()  #: Doppler encoded stereo wav: left wav (incoming) and right wav (outgoing).
+    #: Stereo wav has direction cone: mix left wav (front facing)
+    #: with right wav (rear facing) based on sound facing direction
+    directional = enum.auto()
+    dist_variant = enum.auto()  #: Distance variant encoded stereo wav (left is close, right is far)
+    #: Non-directional - sound appears to play from everywhere,
+    #: but still has distance volume falloff.
+    omni = enum.auto()
+    spatial_stereo = enum.auto()  #: Spatialised stereo wav
+    dir_stereo = enum.auto()  #: Directional stereo wav (like doppler)
+    fast_pitch = enum.auto()  #: Forces low quality, non-interpolated pitch shift
+    subtitled = enum.auto()  #: Indicates subtitles were forced on.
+
+    hrtf_force = enum.auto()  #: CSGO+ only. Enables HRTF for all players including the owner.
+    hrtf = enum.auto()  #: CSGO+ only. Enables HRTF for non-owners.
+    #: CSGO+ only. Enables HRTF for non-owner players, fading to stereo instead if close.
+    hrtf_blend = enum.auto()
+    radio = enum.auto()  #: CSGO+ only. Used for 'radio' sounds tha are played without spatialisation.
+    music = enum.auto()  #: CSGO+ only. Used for main menu music.
+
+    @classmethod
+    def from_fname(cls, filename: str) -> tuple['SoundChars', str]:
+        """Parse sound characters out of a filename, then return both."""
+        flag = cls.none
+        i = 0
+        for i, char in enumerate(filename):
+            try:
+                flag |= CHAR_TO_FLAG[char]
+            except KeyError:
+                break
+        return flag, filename[i:]
+
+    def __str__(self) -> str:
+        return ''.join([
+            char
+            for char, flag in CHAR_TO_FLAG.items()
+            if flag in self
+        ])
+
+
+CHAR_TO_FLAG = {
+    '*': SoundChars.stream,
+    '?': SoundChars.user_vox,
+    '!': SoundChars.sentence,
+    '#': SoundChars.dry_mix,
+    '>': SoundChars.doppler,
+    '<': SoundChars.directional,
+    '^': SoundChars.dist_variant,
+    '@': SoundChars.omni,
+    ')': SoundChars.spatial_stereo,
+    '(': SoundChars.dir_stereo,
+    '}': SoundChars.fast_pitch,
+    '$': SoundChars.subtitled,
+    '&': SoundChars.hrtf_force,
+    '~': SoundChars.hrtf,
+    '`': SoundChars.hrtf_blend,
+    '+': SoundChars.radio,
+    '%': SoundChars.music,
+}
+FLAG_TO_CHAR = {flag: char for char, flag in CHAR_TO_FLAG.items()}
+
+
+class Pitch(float, enum.Enum):
     """The constants permitted for sound pitches."""
     PITCH_NORM = 100.0
     PITCH_LOW = 95.0
     PITCH_HIGH = 120.0
 
     def __str__(self) -> str:
-        return self.name
+        """These names aren't recognised in all cases, just use the value."""
+        return format(self.value, 'g')
+
+    @classmethod
+    def parse_interval_kv(cls, kv: Keyvalues, key: str = 'pitch') -> Interval['Pitch']:
+        """Parse an interval of pitches from a subkey of a keyvalues block."""
+        return parse_split_float(kv, key, cls.__getitem__, cls.PITCH_NORM)
 
 
-class VOLUME(Enum):
+class Volume(enum.Enum):
     """Special value, substitutes default volume (usually 1)."""
     VOL_NORM = 'VOL_NORM'
 
@@ -39,11 +134,17 @@ class VOLUME(Enum):
         """We only have one value, and it's available globally - use that name."""
         return 'srctools.sndscript.VOL_NORM'
 
+    @classmethod
+    def parse_interval_kv(cls, kv: Keyvalues, key: str = 'volume') -> Interval['Volume']:
+        """Parse an interval of volumes from a subkey of a keyvalues block."""
+        return parse_split_float(kv, key, cls.__getitem__, cls.VOL_NORM)
 
-VOL_NORM = VOLUME.VOL_NORM
+
+VOL_NORM = Volume.VOL_NORM
+VOLUME = Volume  # Deprecated alias
 
 # Old compatibility values, replaced by soundlevel.
-ATTENUATION: Dict[str, float] = {
+ATTENUATION: Mapping[str, float] = {
     'ATTN_NONE': 0.0,
     'ATTN_NORM': 0.8,
     'ATTN_IDLE': 2.0,
@@ -53,7 +154,7 @@ ATTENUATION: Dict[str, float] = {
 }
 
 
-class Channel(Enum):
+class Channel(enum.Enum):
     """Different categories of sounds."""
     DEFAULT = "CHAN_AUTO"
     GUNFIRE = "CHAN_WEAPON"
@@ -73,53 +174,111 @@ class Channel(Enum):
         return self.value
 
 
-class Level(Enum):
+class Level(enum.Enum):
     """Soundlevel constants - attenuation."""
-    SNDLVL_NONE = 'SNDLVL_NONE'
-    SNDLVL_20dB = 'SNDLVL_20dB'
-    SNDLVL_25dB = 'SNDLVL_25dB'
-    SNDLVL_30dB = 'SNDLVL_30dB'
-    SNDLVL_35dB = 'SNDLVL_35dB'
-    SNDLVL_40dB = 'SNDLVL_40dB'
-    SNDLVL_45dB = 'SNDLVL_45dB'
-    SNDLVL_50dB = 'SNDLVL_50dB'
-    SNDLVL_55dB = 'SNDLVL_55dB'
-    SNDLVL_IDLE = 'SNDLVL_IDLE'
-    SNDLVL_65dB = 'SNDLVL_65dB'
-    SNDLVL_STATIC = 'SNDLVL_STATIC'
-    SNDLVL_70dB = 'SNDLVL_70dB'
-    SNDLVL_NORM = 'SNDLVL_NORM'
-    SNDLVL_80dB = 'SNDLVL_80dB'
-    SNDLVL_TALKING = 'SNDLVL_TALKING'
-    SNDLVL_85dB = 'SNDLVL_85dB'
-    SNDLVL_90dB = 'SNDLVL_90dB'
-    SNDLVL_95dB = 'SNDLVL_95dB'
-    SNDLVL_100dB = 'SNDLVL_100dB'
-    SNDLVL_105dB = 'SNDLVL_105dB'
-    SNDLVL_110dB = 'SNDLVL_110dB'
-    SNDLVL_120dB = 'SNDLVL_120dB'
-    SNDLVL_125dB = 'SNDLVL_125dB'
-    SNDLVL_130dB = 'SNDLVL_130dB'
-    SNDLVL_GUNFIRE = 'SNDLVL_GUNFIRE'
-    SNDLVL_140dB = 'SNDLVL_140dB'
-    SNDLVL_145dB = 'SNDLVL_145dB'
-    SNDLVL_150dB = 'SNDLVL_150dB'
-    SNDLVL_180dB = 'SNDLVL_180dB'
+    SNDLVL_NONE = 0
+    SNDLVL_IDLE = 60
+    SNDLVL_STATIC = 66
+    SNDLVL_NORM = 75
+    SNDLVL_TALKING = 80
+    SNDLVL_GUNFIRE = 140
 
     def __str__(self) -> str:
         return self.name
 
+    @classmethod
+    def parse(cls, text: str) -> Union[int, 'Level']:
+        """Parse a soundlevel string, which might be a ``SNDLVL`` name or a number."""
+        text = text.upper()
+        try:
+            return cls[text]
+        except KeyError:
+            pass
+        # Game code doesn't actually validate the 'db' bit, just stops as soon as a non-num is present.
+        if (match := re.match(r'SNDLVL_([0-9]+)', text)) is not None:
+            num = int(match.group(1))
+        else:
+            num = conv_int(text, -1)
+        if 0 <= num <= 180:
+            return num
+        else:
+            return Level.SNDLVL_NORM
 
-EnumType = TypeVar('EnumType', bound=Enum)
+    @classmethod
+    def parse_interval_kv(cls, kv: Keyvalues) -> LevelInterval:
+        """Parse an interval of attenuations from the ``soundlevel`` and ``attenuation`` keys of a keyvalues block.
+
+        Unlike others, this is rounded to an integer. Valve's code only supports the ``SNDLVL`` names
+        for a single value, but we allow it for an interval.
+        """
+        if 'attenuation' in kv:
+            atten_min: float
+            atten_max: float
+            atten_min, atten_max = parse_split_float(
+                kv, 'attenuation',
+                ATTENUATION.__getitem__,
+                ATTENUATION['ATTN_IDLE'],
+            )
+            return (atten_to_level(atten_min), atten_to_level(atten_max))
+        elif 'soundlevel' in kv:
+            level_min, level_max = parse_split_float(
+                kv, 'soundlevel',
+                cls.parse,
+                Level.SNDLVL_NORM,
+            )
+            # The game does parse as float then round down, so that's accurate.
+            # We additionally allow SNDLVL constants in both positions.
+            return (
+                level_min if isinstance(level_min, Level) else int(level_min),
+                level_max if isinstance(level_max, Level) else int(level_max),
+            )
+        else:
+            return (Level.SNDLVL_NORM, Level.SNDLVL_NORM)
+
+    @classmethod
+    def join_interval(cls, interval: LevelInterval) -> str:
+        """Convert an interval back to a string. Valve requires full integers for intervals."""
+        low, high = interval
+        # Upgrade to names if possible.
+        try:
+            low = cls(low)
+        except ValueError:
+            pass
+        try:
+            high = cls(high)
+        except ValueError:
+            pass
+        if low == high:
+            if isinstance(low, Level):
+                return str(low)  # SNDLVL_IDLE etc
+            elif low % 5 == 0:  # Standard levels.
+                return f'SNDLVL_{low}dB'
+            else:
+                return str(low)  # Can also be SNDLVL, but nicer to do this.
+        else:
+            if isinstance(low, Level):
+                low = low.value
+            if isinstance(high, Level):
+                high = high.value
+            return f'{low}, {high}'
 
 
-def split_float(
+SOUND_LEVELS: Mapping[str, Union[float, Level]] = {
+    level.name.upper(): level
+    for level in Level
+} | {
+    f'SNDLVL_{x}DB': x
+    for x in range(181)
+}
+
+
+def parse_split_float(
     kv: Keyvalues,
     key: str,
-    enum: Callable[[str], Union[float, EnumType]],
-    default: Union[float, EnumType],
-) -> Tuple[Union[float, EnumType], Union[float, EnumType]]:
-    """Handle values which can be a low, high pair of numbers or enum constants.
+    enum: Callable[[str], Union[float, EnumT]],
+    default: Union[float, EnumT],
+) -> Interval[EnumT]:
+    """Parse pairs of float/enum values from keyvalues.
 
     A single number can be provided, producing the same value for low and high.
 
@@ -135,9 +294,25 @@ def split_float(
         return (default, default)
     if leaf_kv.has_children():
         raise ValueError(f'Keyvalues block used for "{key}" option in "{kv.real_name}" sound!')
-    val = leaf_kv.value
-    if ',' in val:
-        s_low, s_high = val.split(',')
+    return split_float(leaf_kv.value, enum, default)
+
+
+def split_float(
+    value: str,
+    enum: Callable[[str], Union[float, EnumT]],
+    default: Union[float, EnumT],
+) -> Interval[EnumT]:
+    """Handle values which can be a low, high pair of numbers or enum constants.
+
+    A single number can be provided, producing the same value for low and high.
+
+    :param value: The value to read.
+    :param enum: This is either an Enum with values to match text constants, or a converter function
+        returning enums or raising ValueError, KeyError or IndexError.
+    :param default: If either value or the whole string is unparsable, this default is used.
+    """
+    if ',' in value:
+        s_low, s_high = value.split(',')
         try:
             low = enum(s_low.strip().upper())
         except (LookupError, ValueError):
@@ -149,19 +324,35 @@ def split_float(
         return low, high
     else:
         try:
-            out = enum(val.strip().upper())
+            out = enum(value.strip().upper())
         except (LookupError, ValueError):
-            out = conv_float(val, default)
+            out = conv_float(value, default)
         return out, out
 
 
-def join_float(val: Tuple[Union[float, Enum], Union[float, Enum]]) -> str:
+def join_float(val: Interval[enum.Enum]) -> str:
     """Reverse split_float(). The two parameters should be stringifiable into floats/constants."""
     low, high = val
+    low_str = str(low) if isinstance(low, enum.Enum) else format_float(low)
     if low == high:
-        return str(low)
+        return low_str
     else:
-        return f'{low!s}, {high!s}'
+        if isinstance(high, enum.Enum):
+            return f'{low_str}, {high!s}'
+        else:
+            return f'{low_str}, {format_float(high)}'
+
+
+def atten_to_level(attenuation: float) -> int:
+    """Convert an old attenuation value to a soundlevel.
+
+    See ATTN_TO_SNDLVL in :sdk-2025:`public/soundflags.h#L105`
+    # TODO: Link that ^^
+    """
+    if attenuation:
+        return int(50.0 + 20.0 / attenuation)
+    else:
+        return 0
 
 
 class _WAVChunk:
@@ -170,7 +361,7 @@ class _WAVChunk:
     This is copied from the Python Standard Library, 3.11.
     We force little-endian, and to align to 2-byte boundaries.
     """
-    def __init__(self, file: IO[bytes]) -> None:
+    def __init__(self, file: FileRSeek[bytes]) -> None:
         self.closed = False
         self.file = file
         self.chunkname = file.read(4)
@@ -222,7 +413,7 @@ class _WAVChunk:
             self.size_read = self.size_read + n
 
 
-def wav_is_looped(file: IO[bytes]) -> bool:
+def wav_is_looped(file: FileRSeek[bytes]) -> bool:
     """Check if the provided wave file contains loop cue points.
 
     This code is partially copied from wave.Wave_read.initfp().
@@ -247,11 +438,11 @@ def wav_is_looped(file: IO[bytes]) -> bool:
 class Sound:
     """Represents a single soundscript."""
     name: str
-    sounds: List[str] = attrs.Factory(list)
-    volume: Tuple[Union[float, VOLUME], Union[float, VOLUME]] = (VOL_NORM, VOL_NORM)
+    sounds: list[str] = attrs.Factory(list)
+    volume: Interval[Volume] = (VOL_NORM, VOL_NORM)
     channel: Union[int, Channel] = Channel.DEFAULT
-    level: Tuple[Union[float, Level], Union[float, Level]] = (Level.SNDLVL_NORM, Level.SNDLVL_NORM)
-    pitch: Tuple[Union[float, Pitch], Union[float, Pitch]] = (Pitch.PITCH_NORM, Pitch.PITCH_NORM)
+    level: LevelInterval = (Level.SNDLVL_NORM, Level.SNDLVL_NORM)
+    pitch: Interval[Pitch] = (Pitch.PITCH_NORM, Pitch.PITCH_NORM)
 
     _stack_start: Optional[Keyvalues] = None
     _stack_update: Optional[Keyvalues] = None
@@ -261,20 +452,11 @@ class Sound:
     def __init__(
         self,
         name: str,
-        sounds: List[str],
-        volume: Union[
-            Tuple[Union[float, VOLUME], Union[float, VOLUME]],
-            float, VOLUME,
-        ] = (VOL_NORM, VOL_NORM),
+        sounds: list[str],
+        volume: Union[Interval[Volume], float, Volume] = (VOL_NORM, VOL_NORM),
         channel: Union[int, Channel] = Channel.DEFAULT,
-        level: Union[
-            Tuple[Union[float, Level], Union[float, Level]],
-            float, Level,
-        ] = (Level.SNDLVL_NORM, Level.SNDLVL_NORM),
-        pitch: Union[
-            Tuple[Union[float, Pitch], Union[float, Pitch]],
-            float, Pitch,
-        ] = (Pitch.PITCH_NORM, Pitch.PITCH_NORM),
+        level: Union[LevelInterval, int, Level] = (Level.SNDLVL_NORM, Level.SNDLVL_NORM),
+        pitch: Union[Interval[Pitch], float, Pitch] = (Pitch.PITCH_NORM, Pitch.PITCH_NORM),
 
         # Operator stacks
         stack_start: Optional[Keyvalues] = None,
@@ -359,108 +541,88 @@ class Sound:
         return res
 
     @classmethod
-    def parse(cls, file: Keyvalues) -> Dict[str, 'Sound']:
+    def parse(cls, file: Keyvalues) -> dict[str, 'Sound']:
         """Parses a soundscript file.
 
         This returns a dict mapping casefolded names to Sounds.
         """
-        sounds = {}
-        for snd_prop in file:
-            volume = split_float(
-                snd_prop, 'volume',
-                VOLUME.__getitem__,
-                1.0,
+        return {
+            sound_kv.name: cls.parse_one(sound_kv)
+            for sound_kv in file
+        }
+
+    @classmethod
+    def parse_one(cls, sound_kv: Keyvalues) -> 'Sound':
+        """Parse a single soundscript definition."""
+        volume = Volume.parse_interval_kv(sound_kv)
+        pitch = Pitch.parse_interval_kv(sound_kv)
+        level = Level.parse_interval_kv(sound_kv)
+
+        # Either 1 "wave", or multiple in "rndwave".
+        wavs: list[str] = []
+        for prop in sound_kv:
+            if prop.name == 'wave':
+                wavs.append(prop.value)
+            elif prop.name == 'rndwave':
+                for subprop in prop:
+                    wavs.append(subprop.value)
+
+        channel_str = sound_kv['channel', 'CHAN_AUTO'].upper()
+        channel: Union[int, Channel]
+        if channel_str.startswith('CHAN_'):
+            channel = Channel(channel_str)
+        else:
+            channel = int(channel_str)
+
+        sound_version = sound_kv.int('soundentry_version', 1)
+
+        start_stack: Optional[Keyvalues]
+        update_stack: Optional[Keyvalues]
+        stop_stack: Optional[Keyvalues]
+        if 'operator_stacks' in sound_kv:
+            if sound_version == 1:
+                raise ValueError(
+                    'Operator stacks used with version '
+                    f'less than 2 in "{sound_kv.real_name}"!'
+                )
+
+            start_stack, update_stack, stop_stack = (
+                Keyvalues(stack_name, [
+                    prop.copy()
+                    for prop in
+                    sound_kv.find_children('operator_stacks', stack_name)
+                ])
+                for stack_name in
+                ['start_stack', 'update_stack', 'stop_stack']
             )
-            pitch = split_float(
-                snd_prop, 'pitch',
-                Pitch.__getitem__,
-                100.0,
-            )
+        else:
+            start_stack = update_stack = stop_stack = None
 
-            if 'soundlevel' in snd_prop:
-                level = split_float(
-                    snd_prop, 'soundlevel',
-                    Level.__getitem__,
-                    Level.SNDLVL_NORM,
-                )
-            elif 'attenuation' in snd_prop:
-                atten_min, atten_max = split_float(
-                    snd_prop, 'attenuation',
-                    ATTENUATION.__getitem__,
-                    ATTENUATION['ATTN_IDLE'],
-                )
-                # Convert to a soundlevel.
-                # See source_sdk/public/soundflags.h:ATTN_TO_SNDLVL()
-                level = (
-                    (50.0 + 20.0 / atten_min) if atten_min else 0.0,
-                    (50.0 + 20.0 / atten_max) if atten_max else 0.0,
-                )
-            else:
-                level = (Level.SNDLVL_NORM, Level.SNDLVL_NORM)
+        return Sound(
+            sound_kv.real_name,
+            wavs,
+            volume,
+            channel,
+            level,
+            pitch,
+            start_stack,
+            update_stack,
+            stop_stack,
+            sound_version == 2,
+        )
 
-            # Either 1 "wave", or multiple in "rndwave".
-            wavs: List[str] = []
-            for prop in snd_prop:
-                if prop.name == 'wave':
-                    wavs.append(prop.value)
-                elif prop.name == 'rndwave':
-                    for subprop in prop:
-                        wavs.append(subprop.value)
-
-            channel_str = snd_prop['channel', 'CHAN_AUTO'].upper()
-            channel: Union[int, Channel]
-            if channel_str.startswith('CHAN_'):
-                channel = Channel(channel_str)
-            else:
-                channel = int(channel_str)
-
-            sound_version = snd_prop.int('soundentry_version', 1)
-
-            if 'operator_stacks' in snd_prop:
-                if sound_version == 1:
-                    raise ValueError(
-                        'Operator stacks used with version '
-                        f'less than 2 in "{snd_prop.real_name}"!'
-                    )
-
-                start_stack, update_stack, stop_stack = (
-                    Keyvalues(stack_name, [
-                        prop.copy()
-                        for prop in
-                        snd_prop.find_children('operator_stacks', stack_name)
-                    ])
-                    for stack_name in
-                    ['start_stack', 'update_stack', 'stop_stack']
-                )
-            else:
-                start_stack, update_stack, stop_stack = [None, None, None]
-
-            sounds[snd_prop.name] = Sound(
-                snd_prop.real_name,
-                wavs,
-                volume,
-                channel,
-                level,
-                pitch,
-                start_stack,
-                update_stack,
-                stop_stack,
-                sound_version == 2,
-            )
-        return sounds
-
-    def export(self, file: TextIO) -> None:
+    def export(self, file: FileWText) -> None:
         """Write a sound to a file.
 
         Pass a file-like object open for text writing.
         """
         file.write(f'"{self.name}"\n\t{{\n')
         file.write(f'\tchannel {self.channel}\n')
-        file.write(f'\tsoundlevel {join_float(self.level)}\n')
+        file.write(f'\tsoundlevel {Level.join_interval(self.level)}\n')
 
-        if self.volume != (1, 1):
+        if self.volume != (1.0, 1.0) and self.volume != (VOL_NORM, VOL_NORM):
             file.write(f'\tvolume {join_float(self.volume)}\n')
-        if self.pitch != (100, 100):
+        if self.pitch != (Pitch.PITCH_NORM, Pitch.PITCH_NORM):
             file.write(f'\tpitch {join_float(self.pitch)}\n')
 
         if len(self.sounds) != 1:

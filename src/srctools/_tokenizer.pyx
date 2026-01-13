@@ -2,16 +2,16 @@
 # cython: binding=True
 """Cython version of the Tokenizer class."""
 from cpython.mem cimport PyMem_Free, PyMem_Malloc, PyMem_Realloc
-from cpython.unicode cimport PyUnicode_AsUTF8AndSize, PyUnicode_FromStringAndSize, PyUnicode_FromKindAndData
-from libc.stdint cimport uint16_t, uint_fast8_t
+from libc.stdint cimport uint_fast8_t, uint16_t, uint_fast32_t
 cimport cython
-
-cdef extern from *:
-    ctypedef unsigned char uchar "unsigned char"  # Using it a lot, this causes it to not be a typedef at all.
 
 cdef object os_fspath
 from os import fspath as os_fspath
 
+from .pythoncapi_compat cimport (
+    PyUnicodeWriter, PyUnicodeWriter_Discard, PyUnicodeWriter_Create, PyUnicodeWriter_Finish,
+    PyUnicodeWriter_WriteChar, PyUnicodeWriter_WriteASCII,
+)
 
 # Import the Token enum from the Python file, and cache references
 # to all the parts.
@@ -47,6 +47,9 @@ cdef:
     object BRACK_OPEN = Token.BRACK_OPEN
     object BRACK_CLOSE = Token.BRACK_CLOSE
 
+    object PAREN_OPEN = Token.PAREN_OPEN
+    object PAREN_CLOSE = Token.PAREN_CLOSE
+
     # Reuse a single tuple for these, since the value is constant.
     tuple EOF_TUP = (Token.EOF, '')
     tuple NEWLINE_TUP = (Token.NEWLINE, '\n')
@@ -62,7 +65,8 @@ cdef:
     tuple BRACK_OPEN_TUP = (BRACK_OPEN, '[')
     tuple BRACK_CLOSE_TUP = (BRACK_CLOSE, ']')
 
-    uchar *EMPTY_BUF = b''  # Initial value, just so it's valid.
+    tuple PAREN_OPEN_TUP = (PAREN_OPEN, '(')
+    tuple PAREN_CLOSE_TUP = (PAREN_CLOSE, ')')
 
 # Characters not allowed for bare names on a line.
 # TODO: Make this an actual constant value, but that won't do the switch optimisation.
@@ -73,6 +77,7 @@ cdef extern from *:
     """
 struct TokFlags {
     unsigned char string_brackets: 1;
+    unsigned char string_parens: 1;
     unsigned char allow_escapes: 1;
     unsigned char colon_operator: 1;
     unsigned char plus_operator: 1;
@@ -84,6 +89,7 @@ struct TokFlags {
     """
     cdef struct TokFlags:
         bint string_brackets
+        bint string_parens
         bint allow_escapes
         bint colon_operator
         bint plus_operator
@@ -94,9 +100,9 @@ struct TokFlags {
         # Records if the last character was a \r, so the next swallows \n.
         bint last_was_cr
 
-# The number of characters to read from a file each time.
-cdef enum:
-    FILE_BUFFER = 1024
+# The number of characters to read from a file each time. Just an object, we're passing to Python
+# code.
+cdef object FILE_BUFFER = 1024
 
 # noinspection PyMissingTypeHints
 cdef class BaseTokenizer:
@@ -142,6 +148,7 @@ cdef class BaseTokenizer:
         self.line_num = 1
         self.flags = {
             'string_brackets': 0,
+            'string_parens': 1,
             'allow_escapes': 0,
             'colon_operator': 0,
             'plus_operator': 0,
@@ -224,6 +231,7 @@ cdef class BaseTokenizer:
                 str_msg = 'File ended unexpectedly!'
             elif message is NEWLINE:
                 str_msg = 'Unexpected newline!'
+            # Unroll all these so the strings are cached, and this hopefully is just a lookup.
             elif message is BRACE_OPEN:
                 str_msg = 'Unexpected "{" character!'
             elif message is BRACE_CLOSE:
@@ -232,6 +240,10 @@ cdef class BaseTokenizer:
                 str_msg = 'Unexpected "[" character!'
             elif message is BRACK_CLOSE:
                 str_msg = 'Unexpected "]" character!'
+            elif message is PAREN_OPEN:
+                str_msg = 'Unexpected "(" character!'
+            elif message is PAREN_CLOSE:
+                str_msg = 'Unexpected ")" character!'
             elif message is COLON:
                 str_msg = 'Unexpected ":" character!'
             elif message is EQUALS:
@@ -311,6 +323,10 @@ cdef class BaseTokenizer:
             value = '{'
         elif tok_val == 7:  # BRACE_CLOSE
             value = '}'
+        elif tok_val == 8:  # PAREN_OPEN
+            value = '('
+        elif tok_val == 9:  # PAREN_CLOSE
+            value = ')'
         elif tok_val == 12:  # BRACK_OPEN
             value = '['
         elif tok_val == 13:  # BRACK_CLOSE
@@ -328,12 +344,26 @@ cdef class BaseTokenizer:
 
         self.pushback.append((tok, value))
 
-    def peek(self):
-        """Peek at the next token, without removing it from the stream."""
-        tok_and_val = <tuple>self.next_token()
-        self.pushback.append(tok_and_val)
+    def peek(self, bint consume_newlines: bool = False):
+        """Peek at the next token, without removing it from the stream.
 
-        return tok_and_val
+        :param consume_newlines: Skip over newlines until a non-newline is found.
+               All tokens are preserved.
+        """
+        cdef tuple tok_and_val = <tuple?>self.next_token()
+        cdef list tokens
+        if consume_newlines and tok_and_val[0] is NEWLINE:
+            tokens = [tok_and_val]
+            while True:
+                tok_and_val = <tuple?>self.next_token()
+                tokens.append(tok_and_val)
+                if tok_and_val[0] is not NEWLINE:
+                    tokens.reverse()
+                    self.pushback.extend(tokens)
+                    return tok_and_val
+        else:
+            self.pushback.append(tok_and_val)
+            return tok_and_val
 
     def skipping_newlines(self):
         """Iterate over the tokens, skipping newlines."""
@@ -382,27 +412,24 @@ cdef class Tokenizer(BaseTokenizer):
         * allow_escapes controls whether \\n-style escapes are expanded.
         * allow_star_comments if enabled allows /* */ comments.
     """
-    cdef object cur_chunk
+    # chunk_iter is either a file.read() method or iterator object.
+    # cur_chunk is the current string part, keeping that alive.
+    cdef str cur_chunk
     cdef object chunk_iter
+    cdef object _periodic_callback
     cdef Py_ssize_t char_index # Position inside cur_chunk
 
-    # Private buffer, to hold string parts we're constructing.
-    # Tokenizers are expected to be temporary, so we just never shrink.
-    cdef Py_ssize_t buf_size  # 2 << x
-    cdef Py_ssize_t buf_pos
-    cdef uchar *val_buffer
-    cdef const uchar *chunk_buf
-    cdef Py_ssize_t chunk_size
+    # The in-progress string we're constructing, or NULL when we finished.
+    cdef PyUnicodeWriter* writer
 
     def __cinit__(self):
-        self.buf_size = 128
-        self.val_buffer = <uchar *>PyMem_Malloc(self.buf_size * sizeof(uchar))
-        self.buf_pos = 0
-        if self.val_buffer is NULL:
-            raise MemoryError
+        self.writer = NULL
 
     def __dealloc__(self):
-        PyMem_Free(self.val_buffer)
+        if self.writer != NULL:
+            # The compat version needs the null check.
+            PyUnicodeWriter_Discard(self.writer)
+            self.writer = NULL
 
     def __init__(
         self,
@@ -410,7 +437,9 @@ cdef class Tokenizer(BaseTokenizer):
         object filename=None,
         error=None,
         *,
+        object periodic_callback = None,
         bint string_bracket: bool = False,
+        bint string_parens: bool = True,
         bint allow_escapes: bool = True,
         bint allow_star_comments: bool = False,
         bint preserve_comments: bool = False,
@@ -418,7 +447,7 @@ cdef class Tokenizer(BaseTokenizer):
         bint plus_operator: bool = False,
     ):
         # Early warning for this particular error.
-        if isinstance(data, bytes) or isinstance(data, bytearray):
+        if isinstance(data, bytes | bytearray):
             raise TypeError(
                 'Cannot parse binary data! Decode to the desired encoding, '
                 'or wrap in io.TextIOWrapper() to decode gradually.'
@@ -426,6 +455,7 @@ cdef class Tokenizer(BaseTokenizer):
 
         cdef TokFlags flags = {
             'string_brackets': string_bracket,
+            'string_parens': string_parens,
             'allow_escapes': allow_escapes,
             'allow_star_comments': allow_star_comments,
             'preserve_comments': preserve_comments,
@@ -439,13 +469,10 @@ cdef class Tokenizer(BaseTokenizer):
         # and then set the iterable to indicate EOF after that.
         if type(data) is str:
             self.cur_chunk = data
-            self.chunk_buf = <const uchar *>PyUnicode_AsUTF8AndSize(data, &self.chunk_size)
             self.chunk_iter = None
         else:
             # The first next_char() call will pull out a chunk.
             self.cur_chunk = ''
-            self.chunk_size = 0
-            self.chunk_buf = EMPTY_BUF
 
             # If a file, use the read method to pull bulk data.
             try:
@@ -456,9 +483,13 @@ cdef class Tokenizer(BaseTokenizer):
             else:
                 flags.file_input = True
 
+        if periodic_callback is None or callable(periodic_callback):
+            self._periodic_callback = periodic_callback
+        else:
+            raise TypeError(f"periodic_callback must be a callable or None, got {periodic_callback!r}")
+
         # We initially add one, so it'll be 0 next.
         self.char_index = -1
-        self.buf_reset()
 
         if not filename:
             # If we're given a file-like object, automatically set the filename.
@@ -473,15 +504,21 @@ cdef class Tokenizer(BaseTokenizer):
         self.flags = flags
 
         # We want to strip a UTF BOM from the start of the file, if it matches.
-        # So pull off the first three characters, and if they don't match,
-        # rebuild the cur_chunk to allow them.
-        # The BOM is b'\xef\xbb\xbf'.
-        if self._next_char()[0] != 0xef:
+        # So read the first, then backtrack if it's not a BOM.
+        first_char, starts_eof = self._next_char()
+        if starts_eof or first_char != 0xFEFF:
             self.char_index -= 1
-        elif self._next_char()[0] != 0xbb:
-            self.char_index -= 2
-        elif self._next_char()[0] != 0xbf:
-            self.char_index -= 3
+
+    @property
+    def periodic_callback(self):
+        """If set, is called periodically when parsing lines. Useful to abort parsing operations."""
+        return self._periodic_callback
+
+    @periodic_callback.setter
+    def periodic_callback(self, callback):
+        if callback is None or callable(callback):
+            self._periodic_callback = callback
+        raise TypeError(f"periodic_callback must be a callable or None, got {callback!r}")
 
     @property
     def string_bracket(self) -> bool:
@@ -494,6 +531,18 @@ cdef class Tokenizer(BaseTokenizer):
     @string_bracket.setter
     def string_bracket(self, bint value) -> None:
         self.flags.string_brackets = value
+
+    @property
+    def string_parens(self) -> bool:
+        """Controls whether (parenthesed) blocks are parsed as a single string-like block.
+
+        If disabled these are parsed as PAREN_OPEN, STRING, PAREN_CLOSE.
+        """
+        return self.flags.string_parens
+
+    @string_parens.setter
+    def string_parens(self, bint value) -> None:
+        self.flags.string_parens = value
 
     @property
     def allow_escapes(self) -> bool:
@@ -540,71 +589,56 @@ cdef class Tokenizer(BaseTokenizer):
     def plus_operator(self, bint value) -> None:
         self.flags.plus_operator = value
 
-    cdef inline bint buf_reset(self) except False:
-        """Reset the temporary buffer."""
-        # Don't bother resizing or clearing, the next append will overwrite.
-        self.buf_pos = 0
+    cdef inline bint writer_reset(self) except False:
+        """Reset the writer."""
+        if self.writer != NULL:
+            # The compat version needs the null check.
+            PyUnicodeWriter_Discard(self.writer)
+            self.writer = NULL  # If Create() raises, ensure we don't have a dead writer here.
+        self.writer = PyUnicodeWriter_Create(0)
         return True
 
-    cdef inline int buf_add_char(self, char new_char) except -1:
-        """Add a character to the temporary buffer, reallocating if needed."""
-        # Temp, so if memory alloc failure occurs we're still in a valid state.
-        cdef uchar *newbuf
-        cdef Py_ssize_t new_size
-        if self.buf_pos >= self.buf_size:
-            new_size = self.buf_size * 2
-            new_buf = <uchar *>PyMem_Realloc(
-                self.val_buffer,
-                new_size * sizeof(uchar),
-            )
-            if new_buf:
-                self.buf_size = new_size
-                self.val_buffer = new_buf
-            else:
-                raise MemoryError
-
-        self.val_buffer[self.buf_pos] = new_char
-        self.buf_pos += 1
-
-    cdef str buf_get_text(self):
-        """Decode the buffer, and return the text."""
-        out = PyUnicode_FromStringAndSize(<char *>self.val_buffer, self.buf_pos)
-        # Don't bother resizing or clearing, the next append will overwrite.
-        self.buf_pos = 0
+    cdef str writer_get(self):
+        """Fetch the result from the buffer, resetting."""
+        assert self.writer != NULL
+        out = PyUnicodeWriter_Finish(self.writer)
+        self.writer = NULL
         return out
 
     # We check all the getitem[] accesses, so don't have Cython recheck.
     @cython.boundscheck(False)
     @cython.wraparound(False)
-    cdef (uchar, bint) _next_char(self):
+    cdef (Py_UCS4, bint) _next_char(self):
         """Return the next character, and a flag to indicate if more characters are present."""
         cdef str chunk
         cdef object chunk_obj
 
         self.char_index += 1
-        if self.char_index < self.chunk_size:
-            return self.chunk_buf[self.char_index], False
+        if self.char_index < len(self.cur_chunk):
+            return self.cur_chunk[self.char_index], False
 
         if self.chunk_iter is None:
-            return b'\x00', True
+            return '\0', True
 
         if self.flags.file_input:
             try:
-                self.cur_chunk = self.chunk_iter(FILE_BUFFER)
+                chunk_obj = self.chunk_iter(FILE_BUFFER)
             except UnicodeDecodeError as exc:
                 raise self._error(f"Could not decode file:\n{exc!s}") from exc
+
+            if isinstance(chunk_obj, bytes):
+                raise TypeError('Cannot parse binary data!')
+            if type(chunk_obj) is not str:
+                raise TypeError(f'Expected string, got {type(chunk_obj).__name__}')
+
+            self.cur_chunk = chunk_obj
             self.char_index = 0
 
-            if type(self.cur_chunk) is str:
-                self.chunk_buf = <const uchar *>PyUnicode_AsUTF8AndSize(self.cur_chunk, &self.chunk_size)
-            else:
-                raise ValueError('Expected string, got ' + type(self.cur_chunk).__name__)
-
-            if self.chunk_size > 0:
-                return self.chunk_buf[0], False
-            else:
+            if len(self.cur_chunk) > 0:
+                return self.cur_chunk[0], False
+            else:  # read() returning blank = EOF.
                 self.chunk_iter = None
-                return b'\x00', True
+                return '\0', True
 
         # Retrieve a chunk from the iterable.
         # Skip empty chunks (shouldn't be there.)
@@ -612,39 +646,43 @@ cdef class Tokenizer(BaseTokenizer):
         # or using list/tuple optimisations.
         while True:
             try:
-                chunk_obj = next(self.chunk_iter, None)
+                chunk_obj = next(self.chunk_iter)
             except UnicodeDecodeError as exc:
                 raise self._error(f"Could not decode file:\n{exc!s}") from exc
-            if chunk_obj is None:
+            except StopIteration:
                 # Out of characters after empty chunks
                 self.chunk_iter = None
-                return  b'\x00', True
+                return  '\0', True
 
             if isinstance(chunk_obj, bytes):
-                raise ValueError('Cannot parse binary data!')
+                raise TypeError('Cannot parse binary data!')
             if type(chunk_obj) is not str:
-                raise ValueError("Data was not a string!")
+                raise TypeError(f'Expected string, got {type(chunk_obj).__name__}')
 
             if len(<str>chunk_obj) > 0:
                 self.cur_chunk = chunk_obj
                 self.char_index = 0
-                self.chunk_buf = <const uchar *>PyUnicode_AsUTF8AndSize(self.cur_chunk, &self.chunk_size)
-                return self.chunk_buf[0], False
+                return self.cur_chunk[0], False
 
     def _get_token(self):
         """Compute the next token."""
         return self.next_token()
 
+    cdef _inc_line_number(self):
+        """Increment the line number count."""
+        self.line_num += 1
+        if self._periodic_callback is not None and self.line_num % 10 == 0:
+            self._periodic_callback()
+
     cdef next_token(self):
         """Return the next token, value pair - this is the C version."""
         cdef:
-            uchar next_char
-            uchar escape_char
-            uchar peek_char
+            Py_UCS4 next_char
+            Py_UCS4 escape_char
+            Py_UCS4 peek_char
             bint is_eof
             int start_line
             bint ascii_only
-            uchar decode[5]
             bint last_was_cr
             bint save_comments
 
@@ -658,42 +696,44 @@ cdef class Tokenizer(BaseTokenizer):
             if is_eof:
                 return EOF_TUP
 
-            if next_char == b'{':
+            if next_char == '{':
                 return BRACE_OPEN_TUP
-            elif next_char == b'}':
+            elif next_char == '}':
                 return BRACE_CLOSE_TUP
-            elif next_char == b'=':
+            elif next_char == '=':
                 return EQUALS_TUP
-            elif next_char == b',':
+            elif next_char == ',':
                 return COMMA_TUP
 
             # Handle newlines, converting \r and \r\n to \n.
-            if next_char == b'\r':
-                self.line_num += 1
+            if next_char == '\r':
+                self._inc_line_number()
                 self.flags.last_was_cr = True
                 return NEWLINE_TUP
-            elif next_char == b'\n':
+            elif next_char == '\n':
                 # Consume the \n in \r\n.
                 if self.flags.last_was_cr:
                     self.flags.last_was_cr = False
                     continue
-                self.line_num += 1
+                self._inc_line_number()
                 return NEWLINE_TUP
             else:
                 self.flags.last_was_cr = False
 
-            if next_char in b' \t':
+            if next_char in ' \t':
                 # Ignore whitespace...
                 continue
 
             # Comments
-            elif next_char == b'/':
+            elif next_char == '/':
                 # The next must be another slash! (//)
                 next_char, is_eof = self._next_char()
-                if next_char == b'*': # /* comment.
+                if next_char == '*': # /* comment.
                     if self.flags.allow_star_comments:
                         start_line = self.line_num
                         save_comments = self.flags.preserve_comments
+                        if save_comments:
+                            self.writer_reset()
                         while True:
                             next_char, is_eof = self._next_char()
                             if is_eof:
@@ -701,11 +741,11 @@ cdef class Tokenizer(BaseTokenizer):
                                     f'Unclosed /* comment '
                                     f'(starting on line {start_line})!',
                                 )
-                            if next_char == b'\n':
-                                self.line_num += 1
+                            if next_char == '\n':
+                                self._inc_line_number()
                                 if save_comments:
-                                    self.buf_add_char(next_char)
-                            elif next_char == b'*':
+                                    PyUnicodeWriter_WriteChar(self.writer, next_char)
+                            elif next_char == '*':
                                 # Check next, next character!
                                 peek_char, is_eof = self._next_char()
                                 if is_eof:
@@ -713,7 +753,7 @@ cdef class Tokenizer(BaseTokenizer):
                                         f'Unclosed /* comment '
                                         f'(starting on line {start_line})!',
                                     )
-                                elif peek_char == b'/':
+                                elif peek_char == '/':
                                     break
                                 else:
                                     # We need to reparse this, to ensure
@@ -721,28 +761,30 @@ cdef class Tokenizer(BaseTokenizer):
                                     self.char_index -= 1
                             else:
                                 if save_comments:
-                                    self.buf_add_char(next_char)
+                                    PyUnicodeWriter_WriteChar(self.writer, next_char)
                         if save_comments:
-                            return COMMENT, self.buf_get_text()
+                            return COMMENT, self.writer_get()
                     else:
                         raise self._error(
                             '/**/-style comments are not allowed!'
                         )
-                elif next_char == b'/':
+                elif next_char == '/':
                     # Skip to end of line.
                     save_comments = self.flags.preserve_comments
+                    if save_comments:
+                        self.writer_reset()
                     while True:
                         next_char, is_eof = self._next_char()
-                        if is_eof or next_char == b'\n':
+                        if is_eof or next_char == '\n':
                             break
                         if save_comments:
-                            self.buf_add_char(next_char)
+                            PyUnicodeWriter_WriteChar(self.writer, next_char)
 
                     # We want to produce the token for the end character -
                     # EOF or NEWLINE.
                     self.char_index -= 1
                     if save_comments:
-                        return COMMENT, self.buf_get_text()
+                        return COMMENT, self.writer_get()
                 else:
                     raise self._error(
                         'Single slash found, '
@@ -753,29 +795,29 @@ cdef class Tokenizer(BaseTokenizer):
                     )
 
             # Strings
-            elif next_char == b'"':
-                self.buf_reset()
+            elif next_char == '"':
+                self.writer_reset()
                 last_was_cr = False
                 while True:
                     next_char, is_eof = self._next_char()
                     if is_eof:
                         raise self._error('Unterminated string!')
-                    if next_char == b'"':
-                        return STRING, self.buf_get_text()
-                    elif next_char == b'\r':
-                        self.line_num += 1
+                    if next_char == '"':
+                        return STRING, self.writer_get()
+                    elif next_char == '\r':
+                        self._inc_line_number()
                         last_was_cr = True
-                        self.buf_add_char(b'\n')
+                        PyUnicodeWriter_WriteChar(self.writer, '\n')
                         continue
-                    elif next_char == b'\n':
+                    elif next_char == '\n':
                         if last_was_cr:
                             last_was_cr = False
                             continue
-                        self.line_num += 1
+                        self._inc_line_number()
                     else:
                         last_was_cr = False
 
-                    if next_char == b'\\' and self.flags.allow_escapes:
+                    if next_char == '\\' and self.flags.allow_escapes:
                         # Escape text
                         escape_char, is_eof = self._next_char()
                         if is_eof:
@@ -783,97 +825,107 @@ cdef class Tokenizer(BaseTokenizer):
 
                         # See this code:
                         # https://github.com/ValveSoftware/source-sdk-2013/blob/0d8dceea4310fde5706b3ce1c70609d72a38efdf/sp/src/tier1/utlbuffer.cpp#L57-L69
-                        if escape_char == b'a':
-                            next_char = b'\a'
-                        elif escape_char == b'b':
-                            next_char = b'\b'
-                        elif escape_char == b't':
-                            next_char = b'\t'
-                        elif escape_char == b'n':
-                            next_char = b'\n'
-                        elif escape_char == b'v':
-                            next_char = b'\v'
-                        elif escape_char == b'f':
-                            next_char = b'\f'
-                        elif escape_char == b'r':
-                            next_char = b'\r'
-                        elif escape_char == b'\n':
+                        if escape_char == 'a':
+                            next_char = '\a'
+                        elif escape_char == 'b':
+                            next_char = '\b'
+                        elif escape_char == 't':
+                            next_char = '\t'
+                        elif escape_char == 'n':
+                            next_char = '\n'
+                        elif escape_char == 'v':
+                            next_char = '\v'
+                        elif escape_char == 'f':
+                            next_char = '\f'
+                        elif escape_char == 'r':
+                            next_char = '\r'
+                        elif escape_char == '\n':
                             # \ at end of line ignores the newline.
                             continue
-                        elif escape_char in (b'"', b'\\', b'/', b"'", b'?'):
+                        elif escape_char in ('"', '\\', '/', "'", '?'):
                             # For these, we escape to give the literal value.
                             next_char = escape_char
                         else:
-                            # For unknown escape_chars, escape the \ automatically.
-                            self.buf_add_char(b'\\')
-                            self.buf_add_char(escape_char)
+                            # For unknown escape_chars, leave unchanged.
+                            PyUnicodeWriter_WriteChar(self.writer, '\\')
+                            PyUnicodeWriter_WriteChar(self.writer, escape_char)
                             continue
                             # raise self.error('Unknown escape_char "\\{}" in {}!', escape_char, self._cur_chunk)
-                    self.buf_add_char(next_char)
+                    PyUnicodeWriter_WriteChar(self.writer, next_char)
 
-            elif next_char == b'[':
+            elif next_char == '[':
                 # FGDs use [] for grouping, Properties use it for flags.
                 if not self.flags.string_brackets:
                     return BRACK_OPEN_TUP
 
-                self.buf_reset()
+                self.writer_reset()
                 while True:
                     next_char, is_eof = self._next_char()
                     # Must be one line!
-                    if is_eof or next_char == b'\n':
+                    if is_eof or next_char == '\n':
                         raise self._error(
                             'Reached end of line '
                             'without closing "]"!'
                         )
-                    if next_char == b'[':
+                    if next_char == '[':
                         # Don't allow nesting, that's bad.
                         raise self._error('Cannot nest [] brackets!')
-                    elif next_char == b']':
-                        return PROP_FLAG, self.buf_get_text()
-                    self.buf_add_char(next_char)
+                    elif next_char == ']':
+                        return PROP_FLAG, self.writer_get()
+                    PyUnicodeWriter_WriteChar(self.writer, next_char)
 
-            elif next_char == b']':
+            elif next_char == ']':
                 if self.flags.string_brackets:
                     # If string_bracket is set (using PROP_FLAG), this is a
                     # syntax error - we don't have an open one to close!
                     raise self._error('No open [] to close with "]"!')
                 return BRACK_CLOSE_TUP
 
-            elif next_char == b'(':
+            elif next_char == '(':
                 # Parentheses around text...
-                self.buf_reset()
+                # Some code might want to parse this individually.
+                if not self.flags.string_parens:
+                    return PAREN_OPEN_TUP
+
+                self.writer_reset()
                 while True:
                     next_char, is_eof = self._next_char()
                     if is_eof:
                         raise self._error('Unterminated parentheses!')
-                    if next_char == b'(':
+                    if next_char == '(':
                         raise self._error('Cannot nest () brackets!')
-                    elif next_char == b')':
-                        return PAREN_ARGS, self.buf_get_text()
-                    elif next_char == b'\n':
-                        self.line_num += 1
-                    self.buf_add_char(next_char)
+                    elif next_char == ')':
+                        return PAREN_ARGS, self.writer_get()
+                    elif next_char == '\n':
+                        self._inc_line_number()
+                    PyUnicodeWriter_WriteChar(self.writer, next_char)
 
-            elif next_char == b')':
-                raise self._error('No open () to close with ")"!')
+            elif next_char == ')':
+                if self.flags.string_parens:
+                    # If string_parens is set (using PAREN_ARGS), this is a
+                    # syntax error - we don't have an open one to close!
+                    raise self._error('No open () to close with ")"!')
+                return PAREN_CLOSE_TUP
 
             # Directives
-            elif next_char == b'#':
-                self.buf_reset()
+            elif next_char == '#':
+                self.writer_reset()
+                # If it's entirely ascii, we can do the conversion inline, skip calling
+                # unicode logic.
                 ascii_only = True
                 while True:
                     next_char, is_eof = self._next_char()
                     if is_eof:
                         # A directive could be the last value in the file.
                         if ascii_only:
-                            return DIRECTIVE, self.buf_get_text()
+                            return DIRECTIVE, self.writer_get()
                         else:
-                            return DIRECTIVE, self.buf_get_text().casefold()
+                            return DIRECTIVE, self.writer_get().casefold()
 
                     elif (
                         next_char in BARE_DISALLOWED
-                        or (next_char == b':' and self.flags.colon_operator)
-                        or (next_char == b'+' and self.flags.plus_operator)
+                        or (next_char == ':' and self.flags.colon_operator)
+                        or (next_char == '+' and self.flags.plus_operator)
                     ):
                         # We need to repeat this, so we return the ending
                         # char next. If it's not allowed, that'll error on
@@ -881,59 +933,51 @@ cdef class Tokenizer(BaseTokenizer):
                         self.char_index -= 1
                         # And return the directive.
                         if ascii_only:
-                            return DIRECTIVE, self.buf_get_text()
+                            return DIRECTIVE, self.writer_get()
                         else:
                             # Have to go through Unicode lowering.
-                            return DIRECTIVE, self.buf_get_text().casefold()
+                            return DIRECTIVE, self.writer_get().casefold()
                     elif next_char >= 128:
                         # This is non-ASCII, run through the full
                         # Unicode-compliant conversion.
                         ascii_only = False
-                        self.buf_add_char(next_char)
+                        PyUnicodeWriter_WriteChar(self.writer, next_char)
                     else:
                         # If ASCII, use bitwise math to convert over.
-                        if b'A' <= next_char <= b'Z':
-                            self.buf_add_char(next_char + 0x20)
+                        if 'A' <= next_char <= 'Z':
+                            PyUnicodeWriter_WriteChar(self.writer, (<uint_fast32_t>next_char + 0x20))
                         else:
-                            self.buf_add_char(next_char)
+                            PyUnicodeWriter_WriteChar(self.writer, next_char)
 
             else:  # These complex checks can't be in a switch, so we need to nest this.
-                if next_char == b':' and self.flags.colon_operator:
+                if next_char == ':' and self.flags.colon_operator:
                     return COLON_TUP
-                if next_char == b'+' and self.flags.plus_operator:
+                if next_char == '+' and self.flags.plus_operator:
                     return PLUS_TUP
                 # Bare names
                 if next_char not in BARE_DISALLOWED:
-                    self.buf_reset()
-                    self.buf_add_char(next_char)
+                    self.writer_reset()
+                    PyUnicodeWriter_WriteChar(self.writer, next_char)
                     while True:
                         next_char, is_eof = self._next_char()
                         if is_eof:
                             # Bare names at the end are actually fine.
                             # It could be a value for the last prop.
-                            return STRING, self.buf_get_text()
+                            return STRING, self.writer_get()
 
                         elif (
                             next_char in BARE_DISALLOWED
-                            or (next_char == b':' and self.flags.colon_operator)
-                            or (next_char == b'+' and self.flags.plus_operator)
+                            or (next_char == ':' and self.flags.colon_operator)
+                            or (next_char == '+' and self.flags.plus_operator)
                         ):  # We need to repeat this so we return the ending
                             # char next. If it's not allowed, that'll error on
                             # next call.
                             self.char_index -= 1
-                            return STRING, self.buf_get_text()
+                            return STRING, self.writer_get()
                         else:
-                            self.buf_add_char(next_char)
+                            PyUnicodeWriter_WriteChar(self.writer, next_char)
                 else:
-                    # Add in a few more bytes, so we can decode the UTF8 fully.
-                    decode = [
-                        next_char,
-                        self._next_char()[0],
-                        self._next_char()[0],
-                        self._next_char()[0],
-                        0x00,
-                    ]
-                    raise self._error(f'Unexpected characters "{decode[:4].decode("utf8", "backslashreplace")}"' '!')
+                    raise self._error(f'Unexpected character "{next_char}"' '!')
 
 
 cdef class IterTokenizer(BaseTokenizer):
@@ -1055,79 +1099,71 @@ cdef class BlockIter:
 
 
 cdef inline Py_ssize_t _write_escape(
-    uchar *out_buff,
+    Py_UCS4 *out_buff,
     Py_ssize_t off,
-    uchar symbol,
+    Py_UCS4 symbol,
 ) noexcept:
     # Escape a single letter.
-    out_buff[off] = b'\\'
+    out_buff[off] = '\\'
     off += 1
     out_buff[off] = symbol
     return off
 
 
 @cython.nonecheck(False)
-def escape_text(str text not None: str) -> str:
+def escape_text(str text not None: str, bint multiline: bool = False) -> str:
     r"""Escape special characters and backslashes, so tokenising reproduces them.
 
     This matches utilbuffer.cpp in the SDK.
-    The following characters are escaped: \n, \t, \v, \b, \r, \f, \a, \, ', ".
-    / and ? are accepted as escapes, but not produced since they're unambiguous.
+    The following characters are escaped: \t, \v, \b, \r, \f, \a, \, ".
+    /, ' and ? are accepted as escapes, but not produced since they're unambiguous.
+    In addition, \n is escaped only if `multiline` is false.
     """
-    # UTF8 = ASCII for the chars we care about, so we can just loop over the
-    # UTF8 data.
-    cdef Py_ssize_t size = 0
-    cdef Py_ssize_t final_size = 0
-    cdef Py_ssize_t i, j
-    cdef uchar letter
-    cdef const uchar *in_buf = <const uchar *>PyUnicode_AsUTF8AndSize(text, &size)
-    final_size = size
+    cdef Py_ssize_t size = len(text)
+    cdef Py_ssize_t final_size = size
+    cdef Py_UCS4 letter
 
     # First loop to compute the full string length, and check if we need to
     # escape at all.
-    for i in range(size):
-        if in_buf[i] in b'\n\t\v\b\r\f\a\\\'"':
+    for letter in text:
+        if letter in '\t\v\b\r\f\a\\\'"':
+            final_size += 1
+        elif letter == '\n' and not multiline:
             final_size += 1
 
     if size == final_size:  # Unchanged, return original
         return text
 
-    cdef uchar *out_buff
-    j = 0
+    cdef PyUnicodeWriter* writer = PyUnicodeWriter_Create(final_size)
     try:
-        out_buff = <uchar *>PyMem_Malloc(final_size+1 * sizeof(uchar))
-        if out_buff is NULL:
-            raise MemoryError
-        for i in range(size):
-            letter = in_buf[i]
-            # b'ntvbrfa?\'"'
-            if letter == b'\n':
-                j = _write_escape(out_buff, j, b'n')
-            elif letter == b'\t':
-                j = _write_escape(out_buff, j, b't')
-            elif letter == b'\v':
-                j = _write_escape(out_buff, j, b'v')
-            elif letter == b'\b':
-                j = _write_escape(out_buff, j, b'b')
-            elif letter == b'\r':
-                j = _write_escape(out_buff, j, b'r')
-            elif letter == b'\f':
-                j = _write_escape(out_buff, j, b'f')
-            elif letter == b'\a':
-                j = _write_escape(out_buff, j, b'a')
-            elif letter == b'\\':
-                j = _write_escape(out_buff, j, b'\\')
-            elif letter == b'"':
-                j = _write_escape(out_buff, j, b'"')
-            elif letter == b"'":
-                j = _write_escape(out_buff, j, b"'")
+        for letter in text:
+            # b'tvbrfa?\'"'
+            if letter == '\t':
+                PyUnicodeWriter_WriteASCII(writer, b"\\t", 2)
+            elif letter == '\v':
+                PyUnicodeWriter_WriteASCII(writer, b"\\v", 2)
+            elif letter == '\b':
+                PyUnicodeWriter_WriteASCII(writer, b"\\b", 2)
+            elif letter == '\r':
+                PyUnicodeWriter_WriteASCII(writer, b"\\r", 2)
+            elif letter == '\f':
+                PyUnicodeWriter_WriteASCII(writer, b"\\f", 2)
+            elif letter == '\a':
+                PyUnicodeWriter_WriteASCII(writer, b"\\a", 2)
+            elif letter == '\\':
+                PyUnicodeWriter_WriteASCII(writer, b"\\\\", 2)
+            elif letter == '"':
+                PyUnicodeWriter_WriteASCII(writer, b"\\\"", 2)
             else:
-                out_buff[j] = letter
-            j += 1
-        out_buff[final_size] = b'\0'
-        return PyUnicode_FromStringAndSize(<char *>out_buff, final_size)
-    finally:
-        PyMem_Free(out_buff)
+                if letter == "\n" and not multiline:
+                    PyUnicodeWriter_WriteASCII(writer, b"\\n", 2)
+                else:
+                    PyUnicodeWriter_WriteChar(writer, letter)
+
+        return PyUnicodeWriter_Finish(writer)
+    except:
+        PyUnicodeWriter_Discard(writer)
+        raise
 
 
 # This is a replacement for a method in VPK, which is very slow normally
@@ -1139,14 +1175,14 @@ cdef class _VPK_IterNullstr:
     indicting the end of a section.
     """
     cdef object file
-    cdef uchar *chars
+    cdef unsigned char *chars
     cdef Py_ssize_t size
     cdef Py_ssize_t used
 
     def __cinit__(self):
         self.used = 0
         self.size = 64
-        self.chars = <uchar *>PyMem_Malloc(self.size)
+        self.chars = <unsigned char *>PyMem_Malloc(self.size)
         if self.chars is NULL:
             raise MemoryError
 
@@ -1161,7 +1197,7 @@ cdef class _VPK_IterNullstr:
 
     def __next__(self):
         cdef bytes data
-        cdef uchar *temp
+        cdef unsigned char *temp
         while True:
             data = self.file.read(1)
             if len(data) == 0:
@@ -1185,7 +1221,7 @@ cdef class _VPK_IterNullstr:
             else:
                 if self.used == self.size:
                     self.size *= 2
-                    temp = <uchar *>PyMem_Realloc(self.chars, self.size)
+                    temp = <unsigned char *>PyMem_Realloc(self.chars, self.size)
                     if temp == NULL:
                         raise MemoryError
                     self.chars = temp
@@ -1207,7 +1243,7 @@ cdef class _EngineStringTable:
     @cython.wraparound(False)  # Unsigned integers.
     def __call__(self):
         cdef bytes byt = self.read_func(2)
-        cdef uchar *buf = byt
+        cdef unsigned char *buf = byt
         # Unpack an unsigned 16-bit integer.
         cdef uint16_t offset = (buf[1] << 8) | buf[0]
         return self.inv_list[offset]

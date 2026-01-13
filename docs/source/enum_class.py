@@ -1,34 +1,38 @@
 """Implements a documenter for Enum classes."""
 from collections import defaultdict
+from collections.abc import Iterable
+from inspect import Signature
 
-from typing import Any, Dict, Iterable, List, Tuple, Type
+from typing import Any
 from dataclasses import dataclass
 import enum
 import functools
 
-from sphinx.ext.autodoc import ClassDocumenter, AttributeDocumenter, ObjectMember, bool_option
+from sphinx.ext.autodoc import ClassDocumenter, AttributeDocumenter, ObjectMember
+
+from srctools import conv_bool
 
 
 @dataclass
 class EnumInfo:
     """Computed member info."""
-    cls: Type[enum.Enum]
-    aliases: Dict[str, List[str]]
-    canonical: List[enum.Enum]
+    cls: type[enum.Enum]
+    aliases: dict[str, list[str]]
+    canonical: list[enum.Enum]
     should_hex: bool = False
 
 
-@functools.lru_cache(maxsize=None)
-def enum_aliases(enum_obj: Type[enum.Enum]) -> EnumInfo:
+@functools.cache
+def enum_aliases(enum_obj: type[enum.Enum]) -> EnumInfo:
     """Compute the aliases for this enum."""
-    aliases: Dict[str, List[str]] = defaultdict(list)
-    canonical: List[enum.Enum] = []
+    aliases: dict[str, list[str]] = defaultdict(list)
+    canonical: list[enum.Enum] = []
     for name, member in enum_obj.__members__.items():
         if name != member.name:
             aliases[member.name].append(name)
         else:
             canonical.append(member)
-    return EnumInfo(enum_obj, dict(aliases), canonical)
+    return EnumInfo(enum_obj, dict(aliases), canonical, should_hex=issubclass(enum_obj, enum.Flag))
 
 
 class EnumDocumenter(ClassDocumenter):
@@ -38,7 +42,8 @@ class EnumDocumenter(ClassDocumenter):
     priority = 10 + ClassDocumenter.priority
     option_spec = {
         **ClassDocumenter.option_spec,
-        'hex': bool_option,
+        # If value is blank (=None), treat as set
+        'hex': lambda value: conv_bool(value, True),
     }
     del option_spec['show-inheritance']
 
@@ -48,17 +53,22 @@ class EnumDocumenter(ClassDocumenter):
         self.options = self.options.copy()
         self.options['show-inheritance'] = True
 
+    def _get_signature(self) -> tuple[Any | None, str | None, Signature | None]:
+        """Don't show the guts of EnumMeta."""
+        return None, None, None
+
     @classmethod
     def can_document_member(cls, member: Any, membername: str, isattr: bool, parent: Any) -> bool:
         """We can only document Enums."""
         return isinstance(member, type) and issubclass(member, enum.Enum)
 
-    def filter_members(self, members: Iterable[ObjectMember], want_all: bool) -> List[Tuple[str, Any, bool]]:
+    def filter_members(self, members: Iterable[ObjectMember], want_all: bool) -> list[tuple[str, Any, bool]]:
         """Specially handle enum members."""
-        results: List[Tuple[str, object, bool]] = []
+        results: list[tuple[str, object, bool]] = []
 
         info = enum_aliases(self.object)
-        info.should_hex = self.options.hex
+        if (hex_opt := self.options.get('hex', None)) is not None:
+            info.should_hex = hex_opt
 
         for member in info.canonical:  # Keep in order.
             if member.name.isdigit() and isinstance(member.value, int):
@@ -88,15 +98,18 @@ class EnumMemberDocumenter(AttributeDocumenter):
 
     @classmethod
     def can_document_member(cls, member: Any, membername: str, isattr: bool, parent: Any) -> bool:
-        """We only document members from EnumDocumenter."""
-        return isinstance(parent, EnumDocumenter)
+        """We only document enumeration members."""
+        return (
+            isinstance(parent, EnumDocumenter)
+            and issubclass(enum_cls := parent.object, enum.Enum)
+            and membername in enum_cls.__members__
+        )
 
     def add_directive_header(self, sig: str) -> None:
         """Alter behaviour of the header."""
-        # If we're
         info = enum_aliases(self.parent)
-        if info.should_hex:
-            self.object = NoReprString(f'0x{int(self.object):x}')
+        if info.should_hex and isinstance(self.object, int):
+            self.object = NoReprString(hex(self.object))
         super().add_directive_header(sig)
 
     def add_content(self, *args, **kwargs) -> None:

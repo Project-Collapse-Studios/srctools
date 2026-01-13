@@ -9,25 +9,23 @@ iterable of strings and actually parses it into tokens, while :py:class:`IterTok
 transforming the stream before the destination receives it.
 
 Once the tokenizer is created, either iterate over it or call the tokenizer to fetch the next
-token/value pair. One token of lookahead is supported, accessed by the
-:py:func:`BaseTokenizer.peek()` and  :py:func:`BaseTokenizer.push_back()` methods. They also track
-the current line number as data is read, letting you ``raise BaseTokenizer.error(...)`` to easily
+token/value pair. Lookahead is supported, accessed by the
+:py:func:`BaseTokenizer.peek()` and  :py:func:`BaseTokenizer.push_back()` methods. Tokenizers also track
+the current line number as data is read, letting you :pycode:`raise BaseTokenizer.error(...)` to easily
 produce an exception listing the relevant line number and filename.
 
-Character escapes match matches `utilbuffer.cpp <https://github.com/ValveSoftware/source-sdk-2013/blob/0d8dceea4310fde5706b3ce1c70609d72a38efdf/sp/src/tier1/utlbuffer.cpp#L57-L69>`_ in the SDK.
+Character escapes matches :sdk-2013:`utlbuffer.cpp <tier1/utlbuffer.cpp#L57-L69>` in the SDK.
 Specifically, the following characters are escaped:
-`\\\\n`, `\\\\t`, `\\\\v`, `\\\\b`, `\\\\r`, `\\\\f`, `\\\\a`, `\\`, `?`, `'` and `"`.
-`/` and `?` are accepted as escapes, but not produced since they're unambiguous.
+``\\\\n``, ``\\\\t``, ``\\\\v``, ``\\\\b``, ``\\\\r``, ``\\\\f``, ``\\\\a``, ``\\``, ``?``, ``'`` and ``"``.
+``/`` and ``?`` are accepted as escapes, but not produced since they're unambiguous.
 """
-import re
-from typing import (
-    TYPE_CHECKING, Final, Iterable, Iterator, List, NoReturn, Optional, Tuple, Type,
-    Union,
-)
+from typing import TYPE_CHECKING, Final, NoReturn, Optional, Union
 from typing_extensions import Self, TypeAlias, overload
+from collections.abc import Iterable, Iterator, Callable
 from enum import Enum
 from os import fspath as _conv_path
 import abc
+import re
 
 from srctools import StringPath
 
@@ -40,7 +38,10 @@ __all__ = [
 
 
 def format_exc_fileinfo(msg: str, file: Optional[StringPath], line_num: Optional[int]) -> str:
-    """If a line number or file is provided, include those in the error message."""
+    """If a line number or file is provided, include those in the error message.
+
+    This is the logic for the `str() <str>` form of :class:`TokenSyntaxError`.
+    """
     if file is None and line_num is None:
         return msg
     parts = [msg]
@@ -69,9 +70,9 @@ class TokenSyntaxError(Exception):
     mess: str
     """The error message that occurred."""
     file: Optional[StringPath]
-    """The filename of the file being parsed, or ``None`` if not known."""
+    """The filename of the file being parsed, or `None` if not known."""
     line_num: Optional[int]
-    """The line where the error occurred, or ``None`` if not applicable (EOF, for instance)."""
+    """The line where the error occurred, or `None` if not applicable (EOF, for instance)."""
 
     def __init__(
         self,
@@ -118,12 +119,14 @@ class Token(Enum):
 
     BRACE_OPEN = 6  #: A ``{`` character.
     BRACE_CLOSE = 7  #: A ``}`` character.
+    PAREN_OPEN = 8  #: A ``(`` character. Only used if ``PAREN_ARGS`` is not.
+    PAREN_CLOSE = 9  #: A ``)`` character.
 
     PROP_FLAG = 11  #: A ``[!flag]``
     BRACK_OPEN = 12  #: A ``[`` character. Only used if ``PROP_FLAG`` is not.
     BRACK_CLOSE = 13  #: A ``]`` character.
 
-    COLON = 14  #: A ``:`` character, if :py:attr:`~Tokenizer.colon_operator` is enabled.
+    COLON = 14  #: A ``:`` character, if :py:attr:`Tokenizer.colon_operator` is enabled.
     EQUALS = 15  #: A ``=`` character.
     PLUS = 16  #: A ``+`` character, if :py:attr:`Tokenizer.plus_operator` is enabled.
     COMMA = 17  #: A ``,`` character.
@@ -140,6 +143,9 @@ _OPERATOR_VALS = {
 
     Token.BRACE_OPEN: '{',
     Token.BRACE_CLOSE: '}',
+
+    Token.PAREN_OPEN: '(',
+    Token.PAREN_CLOSE: ')',
 
     Token.BRACK_OPEN: '[',
     Token.BRACK_CLOSE: ']',
@@ -161,7 +167,8 @@ _OPERATORS = {
 
 
 # See https://github.com/ValveSoftware/source-sdk-2013/blob/0d8dceea4310fde5706b3ce1c70609d72a38efdf/sp/src/tier1/utlbuffer.cpp#L57-L69
-ESCAPES = {
+# Key is str | None so we can pass None/EOF to skip a check.
+ESCAPES: dict[Optional[str], str] = {
     'n': '\n',
     't': '\t',
     'v': '\v',
@@ -177,10 +184,15 @@ ESCAPES = {
     '\\': '\\',
     '?': '?',
 }
-ESCAPES_INV = {char: f'\\{sym}' for sym, char in ESCAPES.items()}
+# Regexes to locate escape text, then the dict to locate the resultant character.
+ESCAPES_INV: dict[str, str] = {char: f'\\{sym}' for sym, char in ESCAPES.items() if sym is not None}
 ESCAPE_RE = re.compile('|'.join(
     re.escape(c) for c in ESCAPES_INV
-    if c not in '?/'
+    if c not in "?'/"
+))
+ESCAPE_MULTILINE_RE = re.compile('|'.join(
+    re.escape(c) for c in ESCAPES_INV
+    if c not in "?'/\n"
 ))
 
 #: Characters not allowed for bare strings. These must be quoted.
@@ -193,7 +205,7 @@ class BaseTokenizer(abc.ABC):
      It then provides tools for using those to parse data. This is an :external:py:class:`abc.ABC`,
      a subclass must be used to provide a source for the tokens.
     """
-    error_type: Type[TokenSyntaxError]
+    error_type: type[TokenSyntaxError]
     """The exception class to produce if an error occurs. This must be a subtype of 
     :py:class:`TokenSyntaxError`, since it is passed the line number and filename in addition to
     the error message. The :py:meth:`error()` method can be used to intelligently construct an
@@ -209,20 +221,22 @@ class BaseTokenizer(abc.ABC):
     """
 
     #: If set, this token will be returned next.
-    _pushback: List[Tuple[Token, str]]
+    _pushback: list[tuple[Token, str]]
 
     def __init__(
         self,
-        filename: Optional[StringPath],
-        error: Type[TokenSyntaxError],
+        filename: Union[StringPath, str, bytes, None],
+        error: Optional[type[TokenSyntaxError]],
     ) -> None:
         if filename is not None:
-            self.filename = _conv_path(filename)
-            if isinstance(self.filename, bytes):
+            conv_filename = _conv_path(filename)
+            if isinstance(conv_filename, bytes):
                 # We only use this for display, so if bytes convert.
                 # Call repr() then strip the b'', so we get the
                 # automatic escaping of unprintable characters.
-                self.filename = repr(self.filename)[2:-1]
+                self.filename = repr(conv_filename)[2:-1]
+            else:
+                self.filename = conv_filename
         else:
             self.filename = None
 
@@ -237,15 +251,13 @@ class BaseTokenizer(abc.ABC):
         self.line_num = 1
 
     @overload
-    def error(self, __message: Token) -> TokenSyntaxError: ...
-
+    def error(self, message: Token, /) -> TokenSyntaxError: ...
     @overload
-    def error(self, __message: Token, __value: str) -> TokenSyntaxError: ...
-
+    def error(self, message: Token, value: str, /) -> TokenSyntaxError: ...
     @overload
-    def error(self, __message: str, *args: object) -> TokenSyntaxError: ...
+    def error(self, message: str, /, *args: object) -> TokenSyntaxError: ...
 
-    def error(self, message: Union[str, Token], *args: object) -> TokenSyntaxError:
+    def error(self, message: Union[str, Token], /, *args: object) -> TokenSyntaxError:
         """Raise a syntax error exception.
 
         This returns the :py:class:`TokenSyntaxError` instance, with
@@ -295,11 +307,11 @@ class BaseTokenizer(abc.ABC):
         raise TypeError('Cannot pickle Tokenizers!')
 
     @abc.abstractmethod
-    def _get_token(self) -> Tuple[Token, str]:
+    def _get_token(self) -> tuple[Token, str]:
         """Compute the next token, must be implemented by subclasses."""
         raise NotImplementedError
 
-    def __call__(self) -> Tuple[Token, str]:
+    def __call__(self) -> tuple[Token, str]:
         """Compute and fetch the next token."""
         if self._pushback:
             return self._pushback.pop()
@@ -309,7 +321,7 @@ class BaseTokenizer(abc.ABC):
         """Tokenizers are their own iterator."""
         return self
 
-    def __next__(self) -> Tuple[Token, str]:
+    def __next__(self) -> tuple[Token, str]:
         """Iterate to produce a token, stopping at EOF."""
         tok_and_val = self()
         if tok_and_val[0] is Token.EOF:
@@ -333,13 +345,27 @@ class BaseTokenizer(abc.ABC):
 
         self._pushback.append((tok, value))
 
-    def peek(self) -> Tuple[Token, str]:
-        """Peek at the next token, without removing it from the stream."""
-        tok_and_val = self()
-        self._pushback.append(tok_and_val)
-        return tok_and_val
+    def peek(self, consume_newlines: bool=False) -> tuple[Token, str]:
+        """Peek at the next token, without removing it from the stream.
 
-    def skipping_newlines(self) -> Iterator[Tuple[Token, str]]:
+        :param consume_newlines: Skip over newlines until a non-newline is found.
+               All tokens are preserved.
+        """
+        tok_and_val = self()
+        if consume_newlines and tok_and_val[0] is Token.NEWLINE:
+            tokens = [tok_and_val]
+            while True:
+                tok_and_val = tok, tok_value = self()
+                tokens.append(tok_and_val)
+                if tok is not Token.NEWLINE:
+                    tokens.reverse()
+                    self._pushback.extend(tokens)
+                    return tok_and_val
+        else:
+            self._pushback.append(tok_and_val)
+            return tok_and_val
+
+    def skipping_newlines(self) -> Iterator[tuple[Token, str]]:
         """Iterate over the tokens, skipping newlines."""
         while True:
             tok_and_val = tok, tok_value = self()
@@ -407,10 +433,20 @@ class Tokenizer(BaseTokenizer):
     _cur_chunk: str
     _char_index: int
 
+    periodic_callback: Optional[Callable[[], object]]
+    """If set, is called periodically after a few lines are parsed. 
+    Useful to abort parsing operations from external factors.
+    """
+
     string_bracket: bool
-    """If set, `[bracket]` blocks are parsed as a single string-like block. \
+    """If set, ``[bracket]`` blocks are parsed as a single string-like block. \
     If disabled these are parsed as :py:const:`~Token.BRACK_OPEN`, :py:const:`~Token.STRING` \
     then :py:const:`~Token.BRACK_CLOSE`.
+    """
+    string_parens: bool
+    """If set, ``(bracket)`` blocks are parsed as a single string-like block. \
+    If disabled these are parsed as :py:const:`~Token.PAREN_OPEN`, :py:const:`~Token.STRING` \
+    then :py:const:`~Token.PAREN_CLOSE`.
     """
     allow_escapes: bool
     """This determines whether ``\\n``-style escapes are expanded."""
@@ -429,10 +465,12 @@ class Tokenizer(BaseTokenizer):
     def __init__(
         self,
         data: Union[str, Iterable[str]],
-        filename: Optional[StringPath] = None,
-        error: Type[TokenSyntaxError] = TokenSyntaxError,
+        filename: Union[StringPath, str, bytes, None] = None,
+        error: type[TokenSyntaxError] = TokenSyntaxError,
         *,
+        periodic_callback: Optional[Callable[[], object]] = None,
         string_bracket: bool = False,
+        string_parens: bool = True,
         allow_escapes: bool = True,
         allow_star_comments: bool = False,
         preserve_comments: bool = False,
@@ -463,7 +501,9 @@ class Tokenizer(BaseTokenizer):
             self._chunk_iter = iter(data)
         self._char_index = -1
 
+        self.periodic_callback = periodic_callback
         self.string_bracket = bool(string_bracket)
+        self.string_parens = bool(string_parens)
         self.allow_escapes = bool(allow_escapes)
         self.allow_star_comments = bool(allow_star_comments)
         self.colon_operator = bool(colon_operator)
@@ -482,9 +522,9 @@ class Tokenizer(BaseTokenizer):
             try:
                 for chunk in self._chunk_iter:
                     if isinstance(chunk, bytes):
-                        raise ValueError('Cannot parse binary data!')
+                        raise TypeError('Cannot parse binary data!')
                     if not isinstance(chunk, str):
-                        raise ValueError("Data was not a string!")
+                        raise TypeError(f'Expected string, got {type(chunk).__name__}')
                     if chunk:
                         self._cur_chunk = chunk
                         self._char_index = 0
@@ -494,9 +534,15 @@ class Tokenizer(BaseTokenizer):
             # Out of characters after empty chunks
             return None
 
-    def _get_token(self) -> Tuple[Token, str]:
+    def _inc_line_number(self) -> None:
+        """Increment the line number count."""
+        self.line_num += 1
+        if self.periodic_callback is not None and self.line_num % 10 == 0:
+            self.periodic_callback()
+
+    def _get_token(self) -> tuple[Token, str]:
         """Return the next token, value pair."""
-        value_chars: List[str]
+        value_chars: list[str]
         while True:
             next_char = self._next_char()
             if next_char is None:  # EOF, use a dummy string.
@@ -509,14 +555,14 @@ class Tokenizer(BaseTokenizer):
             # Handle newlines, converting \r and \r\n to \n.
             if next_char == '\r':
                 self._last_was_cr = True
-                self.line_num += 1
+                self._inc_line_number()
                 return Token.NEWLINE, '\n'
             elif next_char == '\n':
                 # Consume the \n in \r\n.
                 if self._last_was_cr:
                     self._last_was_cr = False
                     continue
-                self.line_num += 1
+                self._inc_line_number()
                 return Token.NEWLINE, '\n'
             else:
                 self._last_was_cr = False
@@ -557,6 +603,9 @@ class Tokenizer(BaseTokenizer):
                     value_chars.append(next_char)
 
             elif next_char == '(':
+                # Some code might want to parse this individually.
+                if not self.string_parens:
+                    return Token.PAREN_OPEN, '('
                 # Parentheses around text...
                 value_chars = []
                 while True:
@@ -564,7 +613,7 @@ class Tokenizer(BaseTokenizer):
                     if next_char == ')':
                         return Token.PAREN_ARGS, ''.join(value_chars)
                     elif next_char == '\n':
-                        self.line_num += 1
+                        self._inc_line_number()
                     elif next_char == '(':
                         raise self.error('Cannot nest () brackets!')
                     elif next_char is None:
@@ -591,7 +640,11 @@ class Tokenizer(BaseTokenizer):
                 return Token.BRACK_CLOSE, ']'
 
             elif next_char == ')':
-                raise self.error('No open () to close with ")"!')
+                if self.string_parens:
+                    # If string_parens is set (using PAREN_ARGS), this is a
+                    # syntax error - we don't have an open one to close!
+                    raise self.error('No open () to close with ")"!')
+                return Token.PAREN_CLOSE, ')'
 
             elif next_char == '#':  # A #name "directive", which we casefold.
                 value_chars = []
@@ -635,12 +688,13 @@ class Tokenizer(BaseTokenizer):
 
             else:
                 raise self.error('Unexpected character "{}"!', next_char)
+        raise AssertionError("Infinite loop")
 
-    def _handle_comment(self) -> Optional[Tuple[Token, str]]:
+    def _handle_comment(self) -> Optional[tuple[Token, str]]:
         """Handle a comment. The last character read was the initial slash."""
         # The next must be either a slash (//) or star (/*)
         comment_next = self._next_char()
-        comment_buf: Optional[List[str]] = [] if self.preserve_comments else None
+        comment_buf: Optional[list[str]] = [] if self.preserve_comments else None
         if comment_next == '*':
             # /* comment.
             if self.allow_star_comments:
@@ -654,7 +708,7 @@ class Tokenizer(BaseTokenizer):
                             comment_start,
                         )
                     elif next_char == '\n':
-                        self.line_num += 1
+                        self._inc_line_number()
                         if comment_buf is not None:
                             comment_buf.append(next_char)
                     elif next_char == '*':
@@ -704,16 +758,16 @@ class Tokenizer(BaseTokenizer):
                 return Token.COMMENT, ''.join(comment_buf)
         return None  # Swallow the comment.
 
-    def _handle_string(self) -> Tuple[Token, str]:
+    def _handle_string(self) -> tuple[Token, str]:
         """Handle a quoted string definition. The last character was a quote."""
-        value_chars: List[str] = []
+        value_chars: list[str] = []
         last_was_cr = False
         while True:
             next_char = self._next_char()
             if next_char == '"':
                 return Token.STRING, ''.join(value_chars)
             elif next_char == '\r':
-                self.line_num += 1
+                self._inc_line_number()
                 last_was_cr = True
                 value_chars.append('\n')
                 continue
@@ -721,16 +775,14 @@ class Tokenizer(BaseTokenizer):
                 if last_was_cr:
                     last_was_cr = False
                     continue
-                self.line_num += 1
+                self._inc_line_number()
             else:
                 last_was_cr = False
 
             if next_char == '\\' and self.allow_escapes:
                 # Escape text
                 escape = self._next_char()
-                if escape is None:
-                    raise self.error('No character to escape!')
-                elif escape == '\n':
+                if escape == '\n':
                     continue  # Allow \ at the end of a line to skip.
                 try:
                     next_char = ESCAPES[escape]
@@ -746,6 +798,7 @@ class Tokenizer(BaseTokenizer):
                 raise self.error('Unterminated string!')
             else:
                 value_chars.append(next_char)
+        raise AssertionError("Infinite loop")
 
 
 class IterTokenizer(BaseTokenizer):
@@ -754,13 +807,14 @@ class IterTokenizer(BaseTokenizer):
     This is useful to pre-process a token stream before parsing it with other
     code.
     """
-    source: Iterator[Tuple[Token, str]]
+    #: The underlying iterator which tokens are sourced from.
+    source: Iterator[tuple[Token, str]]
 
     def __init__(
         self,
-        source: Iterable[Tuple[Token, str]],
-        filename: StringPath = '',
-        error: Type[TokenSyntaxError] = TokenSyntaxError,
+        source: Iterable[tuple[Token, str]],
+        filename: Union[StringPath, str, bytes, None] = None,
+        error: type[TokenSyntaxError] = TokenSyntaxError,
     ) -> None:
         super().__init__(filename, error)
         self.source = iter(source)
@@ -771,16 +825,31 @@ class IterTokenizer(BaseTokenizer):
         else:
             return f'IterTokenizer({self.source!r}, {self.filename!r}, {self.error_type!r})'
 
-    def _get_token(self) -> Tuple[Token, str]:
+    def _get_token(self) -> tuple[Token, str]:
         try:
             return next(self.source)
         except StopIteration:
             return Token.EOF, ''
 
 
-def escape_text(text: str) -> str:
-    r"""Escape special characters and backslashes, so tokenising reproduces them."""
-    return ESCAPE_RE.sub(lambda match: ESCAPES_INV[match.group()], text)
+def _escape_matcher(match: re.Match[str]) -> str:
+    """Substitution function for escape_text()."""
+    return ESCAPES_INV[match.group()]
+
+
+def escape_text(text: str, multiline: bool=False) -> str:
+    r"""Escape special characters and backslashes, so tokenising reproduces them.
+
+    This matches utilbuffer.cpp in the SDK.
+    The following characters are escaped: ``\t``, ``\v``, ``\b``, ``\r``, ``\f``,
+    ``\a``, ``\``, ``"``.
+    ``/``, ``'`` and ``?`` are accepted as escapes, but not produced since they're unambiguous.
+    In addition, ``\n`` is escaped only if ``multiline`` is false.
+
+    :parameter text: The text to escape.
+    :parameter multiline: If set, allow ``\n`` unchanged.
+    """
+    return (ESCAPE_MULTILINE_RE if multiline else ESCAPE_RE).sub(_escape_matcher, text)
 
 
 # This is available as both C and Python versions, plus the unprefixed

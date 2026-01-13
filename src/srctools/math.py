@@ -7,37 +7,42 @@ perform repeated operations on a matrix.
 These classes will be replaced by Cython-optimized versions where possible, which are interchangable
 if pickled.
 
-Rotations are performed via the matrix-multiplication operator `@`, where the left is rotated by
+`PointsMap` is a mapping with vector keys, which uses an epsilon distance to allow tolerance in
+matching keys.
+
+Rotations are performed via the matrix-multiplication operator ``@``, where the left is rotated by
 the right. Vectors can be rotated by matrices and angles and matrices can be rotated by angles,
 but not vice-versa.
 
- - ``Vec @ Angle`` → ``Vec``
- - ``Vec @ Matrix`` → ``Vec``
- - ``tuple[x, y, z] @ Angle`` → ``Vec``
- - ``Angle @ Angle`` → ``Angle``
- - ``Angle @ Matrix`` → ``Angle``
- - ``Matrix @ Matrix`` → ``Matrix``
+ - :pycode:`Vec @ Angle` → ``Vec``
+ - :pycode:`Vec @ Matrix` → ``Vec``
+ - :pycode:`tuple[x, y, z] @ Angle` → ``Vec``
+ - :pycode:`Angle @ Angle` → ``Angle``
+ - :pycode:`Angle @ Matrix` → ``Angle``
+ - :pycode:`Matrix @ Matrix` → ``Matrix``
 """
 from typing import (
-    TYPE_CHECKING, Any, Callable, ClassVar, Dict, Final, Iterable, Iterator, List,
-    NamedTuple, Optional, SupportsFloat, SupportsIndex, Tuple, Type, TypeVar, Union, cast,
+    TYPE_CHECKING, Any, ClassVar, Final, NamedTuple, Optional, SupportsFloat,
+    SupportsIndex, TypeVar, Union, cast,
 )
 from typing_extensions import (
     Literal, Protocol, Self, TypeAlias, TypeGuard, deprecated, final, overload,
 )
+from collections.abc import Callable, Iterable, Iterator
 import contextlib
 import math
+import types
 
 
 __all__ = [
     'parse_vec_str', 'to_matrix', 'lerp', 'quickhull', 'format_float',
-    'Vec', 'FrozenVec', 'Vec_tuple', 'AnyVec',
+    'Vec', 'FrozenVec', 'Vec_tuple', 'AnyVec', 'VecUnion', 'PointsMap',
     'Angle', 'FrozenAngle', 'AnyAngle',
     'Matrix', 'FrozenMatrix', 'AnyMatrix',
 ]
 
 # Type aliases
-Tuple3: TypeAlias = Tuple[float, float, float]
+Tuple3: TypeAlias = tuple[float, float, float]
 AnyVec: TypeAlias = Union['VecBase', 'Vec_tuple', Tuple3]
 VecUnion: TypeAlias = Union['Vec', 'FrozenVec']
 AnyAngle: TypeAlias = Union['Angle', 'FrozenAngle']
@@ -46,9 +51,9 @@ Numeric = Union[int, float, SupportsFloat, SupportsIndex]
 VecT = TypeVar('VecT', bound='VecBase')
 AngleT = TypeVar('AngleT', bound='AngleBase')
 MatrixT = TypeVar('MatrixT', bound='MatrixBase')
-T1 = TypeVar('T1')
-T2 = TypeVar('T2')
-T3 = TypeVar('T3')
+X = TypeVar('X')
+Y = TypeVar('Y')
+Z = TypeVar('Z')
 
 
 def lerp(x: float, in_min: float, in_max: float, out_min: float, out_max: float) -> float:
@@ -61,17 +66,20 @@ def lerp(x: float, in_min: float, in_max: float, out_min: float, out_max: float)
 
 def parse_vec_str(
     val: Union[str, 'VecBase', 'AngleBase'],
-    x: Union[T1, float] = 0.0, y: Union[T2, float] = 0.0, z: Union[T3, float] = 0.0,
-) -> Tuple[Union[T1, float], Union[T2, float], Union[T3, float]]:
+    x: Union[X, float] = 0.0, y: Union[Y, float] = 0.0, z: Union[Z, float] = 0.0,
+    # Could more properly be tuple[f,f,f] | tuple[X, Y, Z], but that needs better typevar + default handling.
+) -> tuple[Union[X, float], Union[Y, float], Union[Z, float]]:
     """Convert a string in the form ``(4 6 -4)`` into a set of floats.
 
-    If the string is unparsable or an invalid type, this uses the defaults ``x``, ``y``, ``z``.
-    The string can be surrounded by any of the ``()``, ``{}``, ``[]``, ``<>`` bracket types, which
+    If the string is unparsable or an invalid type, this uses the defaults :pycode:`(x, y, z)` (which don't have to be floats).
+    The string can be surrounded by any of the ``()``, ``{}``, ``[]`` or ``<>`` bracket types, which
     are simply ignored.
 
-    If the 'string' is already a :py:class:`VecBase` or :py:class:`AngleBase`, this will be passed through.
-    If you do want a specific class, use :py:meth:`VecBase.from_str`, :py:meth:`AngleBase.from_str`
-    or :py:meth:`MatrixBase.from_angstr`.
+    If the 'string' is already a `FrozenVec`/`Vec` or a `FrozenAngle`/`Angle`,
+    the component values will be extracted and returned. If you want to parse into one of these
+    classes, use :py:meth:`[Frozen]Vec.from_str() <VecBase.from_str>`,
+    :py:meth:`[Frozen]Angle.from_str() <AngleBase.from_str>`  or
+    :py:meth:`[Frozen]Matrix.from_angstr() <MatrixBase.from_angstr>`.
     """
     if isinstance(val, str):
         pass  # Fast path to skip the below code.
@@ -107,7 +115,12 @@ def parse_vec_str(
 def to_matrix(value: Union['AnyAngle', 'AnyMatrix', 'AnyVec', None]) -> 'Matrix | FrozenMatrix':
     """Convert various values to a rotation matrix.
 
-    :py:class:`Vec` will be treated as angles, and :external:py:data:`None` as the identity.
+    - Existing matrices will be returned unchanged.
+    - `None` is treated as the identity matrix.
+    - `Vec` will be treated as angles.
+
+    :returns: A `FrozenMatrix` only if the value is already a frozen matrix.
+     Otherwise, a new `Matrix` is returned.
     """
     if value is None:
         return Py_Matrix()
@@ -121,12 +134,12 @@ def to_matrix(value: Union['AnyAngle', 'AnyMatrix', 'AnyVec', None]) -> 'Matrix 
 
 
 def format_float(x: float, places: int = 6) -> str:
-    """Convert the specified float to a string, stripping off a .0 if it ends with that."""
-    # Add zero to make -0 positive
-    result = f'{x+0.0:.{places}f}'
+    """Convert the specified float to a string, stripping off a ``.0`` if it ends with that."""
+    result = f'{x:.{places}f}'
     if '.' in result:
         result = result.rstrip('0').rstrip('.')
-    return result
+    # Rarely, values very close to 0 can become '-0'.
+    return '0' if result == '-0' else result
 
 
 def _coerce_float(value: Union[float, SupportsFloat, SupportsIndex]) -> float:
@@ -160,39 +173,38 @@ class Vec_tuple(NamedTuple):
     z: float
 
 
-if TYPE_CHECKING:
-    class _InvAxis(Protocol):
-        """Dummy class to type-check Vec.INV_AXIS"""
-        @overload
-        def __getitem__(self, item: Literal['x']) -> Tuple[Literal['y'], Literal['z']]: ...
-        @overload
-        def __getitem__(self, item: Literal['y']) -> Tuple[Literal['x'], Literal['z']]: ...
-        @overload
-        def __getitem__(self, item: Literal['z']) -> Tuple[Literal['x'], Literal['y']]: ...
+class _InvAxis(Protocol):
+    """Dummy class to type-check Vec.INV_AXIS"""
+    def __len__(self) -> Literal[9]: ...
+    @overload
+    def __getitem__(self, item: Literal['x']) -> tuple[Literal['y'], Literal['z']]: ...
+    @overload
+    def __getitem__(self, item: Literal['y']) -> tuple[Literal['x'], Literal['z']]: ...
+    @overload
+    def __getitem__(self, item: Literal['z']) -> tuple[Literal['x'], Literal['y']]: ...
 
-        @overload
-        def __getitem__(self, item: Tuple[Literal['y'], Literal['z']]) -> Literal['x']: ...
-        @overload
-        def __getitem__(self, item: Tuple[Literal['z'], Literal['y']]) -> Literal['x']: ...
+    @overload
+    def __getitem__(self, item: tuple[Literal['y'], Literal['z']]) -> Literal['x']: ...
+    @overload
+    def __getitem__(self, item: tuple[Literal['z'], Literal['y']]) -> Literal['x']: ...
 
-        @overload
-        def __getitem__(self, item: Tuple[Literal['x'], Literal['z']]) -> Literal['y']: ...
-        @overload
-        def __getitem__(self, item: Tuple[Literal['z'], Literal['x']]) -> Literal['y']: ...
+    @overload
+    def __getitem__(self, item: tuple[Literal['x'], Literal['z']]) -> Literal['y']: ...
+    @overload
+    def __getitem__(self, item: tuple[Literal['z'], Literal['x']]) -> Literal['y']: ...
 
-        @overload
-        def __getitem__(self, item: Tuple[Literal['x'], Literal['y']]) -> Literal['z']: ...
-        @overload
-        def __getitem__(self, item: Tuple[Literal['y'], Literal['x']]) -> Literal['z']: ...
+    @overload
+    def __getitem__(self, item: tuple[Literal['x'], Literal['y']]) -> Literal['z']: ...
+    @overload
+    def __getitem__(self, item: tuple[Literal['y'], Literal['x']]) -> Literal['z']: ...
 
-        @overload
-        def __getitem__(self, item: str) -> Tuple[str, str]: ...
-        @overload
-        def __getitem__(self, item: Tuple[str, str]) -> str: ...
+    @overload
+    def __getitem__(self, item: str) -> tuple[str, str]: ...
+    @overload
+    def __getitem__(self, item: tuple[str, str]) -> str: ...
 
-        def __getitem__(self, item: Union[Tuple[str, str], str]) -> Union[Tuple[str, str], str]: ...
-else:
-    globals()['_InvAxis'] = None
+    def __getitem__(self, item: Union[tuple[str, str], str]) -> Union[tuple[str, str], str]: ...
+
 
 # Use template code to reduce duplication in the various magic number methods.
 
@@ -328,9 +340,7 @@ class VecBase:
     __slots__ = ('_x', '_y', '_z')
     __hash__ = None  # type: ignore[assignment]
 
-    #: This is a dictionary containing complementary axes.
-    #: ``INV_AXIS["x", "y"]`` gives ``"z"``, and ``INV_AXIS["y"]`` returns ``("x", "z")``.
-    INV_AXIS = cast(_InvAxis, {
+    INV_AXIS: ClassVar[_InvAxis] = cast(_InvAxis, types.MappingProxyType({
         'x': ('y', 'z'),
         'y': ('x', 'z'),
         'z': ('x', 'y'),
@@ -342,7 +352,7 @@ class VecBase:
         ('z', 'y'): 'x',
         ('z', 'x'): 'y',
         ('y', 'x'): 'z',
-    })
+    }))
 
     # Vectors pointing in all cardinal directions.
     # Variable annotation here, it has to be assigned after FrozenVec
@@ -399,9 +409,9 @@ class VecBase:
         cls, val: Union[str, 'VecBase'],
         x: float = 0.0, y: float = 0.0, z: float = 0.0,
     ) -> Self:
-        """Convert a string in the form ``(4 6 -4)`` into a Vector.
+        """Convert a string in the form :samp:`(4 6 -4)` into a Vector.
 
-        If the string is unparsable, this uses the defaults ``(x,y,z)``.
+        If the string is unparsable, this uses the defaults :pycode:`(x, y, z)`.
         The string can be surrounded by any of the ``()``, ``{}``, ``[]``, ``<>`` bracket types,
         which are simply ignored.
 
@@ -438,6 +448,7 @@ class VecBase:
         """Create a Vector, given a number of axes and corresponding values.
 
         This is a convenience for doing the following::
+
             vec = Vec()
             vec[axis1] = val1
             vec[axis2] = val2
@@ -450,39 +461,39 @@ class VecBase:
 
     @classmethod
     @overload
-    def bbox(cls, __point: Iterable['VecBase']) -> Tuple[Self, Self]: ...
+    def bbox(cls, point: Iterable['VecBase'], /) -> tuple[Self, Self]: ...
     @classmethod
     @overload
-    def bbox(cls, *points: 'VecBase') -> Tuple[Self, Self]: ...
+    def bbox(cls, point: 'VecBase', /, *points: 'VecBase') -> tuple[Self, Self]: ...
 
     @classmethod
-    def bbox(cls, *points: Union[Iterable['VecBase'], 'VecBase']) -> Tuple[Self, Self]:
+    # Should be *points: *tuple[Iterable[VecBase]] | *tuple[VecBase, ...], but can't unpack union.
+    # Assign to the correct type in func body.
+    def bbox(cls, /, *points_arg: Any) -> tuple[Self, Self]:
         """Compute the bounding box for a set of points.
 
         Pass either several Vecs, or an iterable of Vecs.
         Returns a ``(min, max)`` :external:py:class:`tuple`.
         """
+        points: Union[tuple[Iterable[VecBase]], tuple[VecBase, ...]] = points_arg
+        points_iter: Iterator[VecBase]
         # Allow passing a single iterable, but also handle a single Vec.
-        # The error messages match those produced by min()/max().
-        first: VecBase
-        point_coll: Iterable[VecBase]
+        # The error messages match those produced by `min`/`max`.
+        if len(points) == 0:
+            raise TypeError('Vec.bbox() expected at least 1 argument, got 0.')
         if len(points) == 1 and not isinstance(points[0], VecBase):
+            points_iter = iter(points[0])
             try:
-                [[first, *point_coll]] = points  # type: ignore # len() can't narrow
-            except ValueError:
+                first = next(points_iter)
+            except StopIteration:
                 raise ValueError('Vec.bbox() arg is an empty sequence') from None
         else:
-            try:
-                first, *point_coll = points  # type: ignore # len() can't narrow
-            except ValueError:
-                raise TypeError(
-                    'Vec.bbox() expected at '
-                    'least 1 argument, got 0.'
-                ) from None
+            points_iter = iter(points)  # pyright: ignore
+            first = next(points_iter)
 
         bbox_min: Py_Vec = Py_Vec(first)
         bbox_max = bbox_min.copy()
-        for point in point_coll:
+        for point in points_iter:
             bbox_min.min(point)
             bbox_max.max(point)
         if cls is Py_FrozenVec:
@@ -564,7 +575,7 @@ class VecBase:
         """Convert a normal to a Source Engine angle.
 
         The angle will point its ``+x`` axis in the direction of this vector.
-        The inverse of this is ``Vec(x=1) @ Angle(pitch, yaw, roll)``.
+        The inverse of this is :pycode:`Vec(x=1) @ Angle(pitch, yaw, roll)`.
 
         :param roll: The roll is not affected by the direction of the vector, so it can be provided separately.
         """
@@ -632,7 +643,7 @@ class VecBase:
     del _funcname, _op, _pretty
 
     # Divmod is entirely unique.
-    def __divmod__(self, other: float) -> Tuple[Self, Self]:
+    def __divmod__(self, other: float) -> tuple[Self, Self]:
         """Divide the vector by a scalar, returning the result and remainder."""
         if isinstance(other, VecBase):
             raise TypeError("Cannot divide 2 Vectors.")
@@ -640,12 +651,12 @@ class VecBase:
             x1, x2 = divmod(self.x, other)
             y1, y2 = divmod(self.y, other)
             z1, z2 = divmod(self.z, other)
-        except TypeError:
+        except (TypeError, ValueError):
             return NotImplemented
         else:
             return type(self)(x1, y1, z1), type(self)(x2, y2, z2)
 
-    def __rdivmod__(self, other: float) -> Tuple[Self, Self]:
+    def __rdivmod__(self, other: float) -> tuple[Self, Self]:
         """Divide a scalar by a vector, returning the result and remainder."""
         if isinstance(other, VecBase):
             raise TypeError("Cannot divide 2 Vectors.")
@@ -654,7 +665,7 @@ class VecBase:
             y1, y2 = divmod(other, self.y)
             z1, z2 = divmod(other, self.z)
         except (TypeError, ValueError):
-            return NotImplemented
+            return NotImplemented  # type: ignore[no-any-return]
         else:
             return type(self)(x1, y1, z1), type(self)(x2, y2, z2)
 
@@ -702,7 +713,7 @@ class VecBase:
 
         Two Vectors are compared based on the axes.
         A Vector can be compared with a 3-tuple as if it was a Vector also.
-        A tolerance of 1e-6 is accounted for automatically.
+        A tolerance of ``1e-6`` is accounted for automatically.
         """
         if isinstance(other, VecBase):
             return (
@@ -724,7 +735,7 @@ class VecBase:
 
         Two Vectors are compared based on the axes.
         A Vector can be compared with a 3-tuple as if it was a Vector also.
-        A tolerance of 1e-6 is accounted for automatically.
+        A tolerance of ``1e-6`` is accounted for automatically.
         """
         if isinstance(other, VecBase):
             return (
@@ -746,7 +757,7 @@ class VecBase:
 
         Two Vectors are compared based on the axes.
         A Vector can be compared with a 3-tuple as if it was a Vector also.
-        A tolerance of 1e-6 is accounted for automatically.
+        A tolerance of ``1e-6`` is accounted for automatically.
         """
         if isinstance(other, VecBase):
             return (
@@ -768,7 +779,7 @@ class VecBase:
 
         Two Vectors are compared based on the axes.
         A Vector can be compared with a 3-tuple as if it was a Vector also.
-        A tolerance of 1e-6 is accounted for automatically.
+        A tolerance of ``1e-6`` is accounted for automatically.
         """
         if isinstance(other, VecBase):
             return (
@@ -790,7 +801,7 @@ class VecBase:
 
         Two Vectors are compared based on the axes.
         A Vector can be compared with a 3-tuple as if it was a Vector also.
-        A tolerance of 1e-6 is accounted for automatically.
+        A tolerance of ``1e-6`` is accounted for automatically.
         """
         if isinstance(other, VecBase):
             return (
@@ -907,15 +918,15 @@ class VecBase:
 
         This strips off the ``.0`` if no decimal portion exists.
         """
-        return f'{format_float(self._x)}{delim}{format_float(self._y)}{delim}{format_float(self._z)}'
+        return f'{Py_format_float(self._x)}{delim}{Py_format_float(self._y)}{delim}{Py_format_float(self._z)}'
 
     def __str__(self) -> str:
         """Return the values, separated by spaces.
 
         This is the main format in Valve's file formats.
-        This strips off the .0 if no decimal portion exists.
+        This strips off the ``.0`` if no decimal portion exists.
         """
-        return f'{format_float(self._x)} {format_float(self._y)} {format_float(self._z)}'
+        return f'{Py_format_float(self._x)} {Py_format_float(self._y)} {Py_format_float(self._z)}'
 
     def __format__(self, format_spec: str) -> str:
         """Control how the text is formatted.
@@ -925,17 +936,23 @@ class VecBase:
         if not format_spec:
             return str(self)
 
-        x = format(self._x + 0.0, format_spec)
+        x = format(self._x, format_spec)
         if '.' in x:
             x = x.rstrip('0').rstrip('.')
+        if x == '-0':
+            x = '0'
 
-        y = format(self._y + 0.0, format_spec)
+        y = format(self._y, format_spec)
         if '.' in y:
             y = y.rstrip('0').rstrip('.')
+        if y == '-0':
+            y = '0'
 
-        z = format(self._z + 0.0, format_spec)
+        z = format(self._z, format_spec)
         if '.' in z:
             z = z.rstrip('0').rstrip('.')
+        if z == '-0':
+            z = '0'
         return f'{x} {y} {z}'
 
     def __iter__(self) -> Iterator[float]:
@@ -983,7 +1000,7 @@ class VecBase:
             return False
         return True
 
-    def other_axes(self, axis: str) -> Tuple[float, float]:
+    def other_axes(self, axis: str) -> tuple[float, float]:
         """Get the values for the other two axes."""
         if axis == 'x':
             return self._y, self._z
@@ -1088,7 +1105,7 @@ class FrozenVec(VecBase):
     ) -> 'FrozenVec':
         """Create a ``FrozenVec``.
 
-        All values are converted to :external:py:class:`float`\\ s automatically.
+        All values are converted to floats automatically.
         If no value is given, that axis will be set to ``0``.
         An iterable can be passed in (as the ``x`` argument), which will be
         used for ``x``, ``y``, and ``z``.
@@ -1096,7 +1113,7 @@ class FrozenVec(VecBase):
         # Already a FrozenVec.
         if isinstance(x, cls):
             return x
-        res = object.__new__(cls)
+        res: FrozenVec = object.__new__(cls)
         if isinstance(x, (int, float)):
             res._x = float(x)
             res._y = float(y)
@@ -1184,15 +1201,15 @@ class FrozenVec(VecBase):
         """FrozenVec is immutable."""
         return self
 
-    def __deepcopy__(self, memodict: Optional[Dict[str, Any]] = None) -> 'FrozenVec':
+    def __deepcopy__(self, memodict: dict[int, Any]) -> 'FrozenVec':
         """FrozenVec is immutable."""
         return self
 
     def __repr__(self) -> str:
         """Code required to reproduce this vector."""
-        return f"FrozenVec({format_float(self._x)}, {format_float(self._y)}, {format_float(self._z)})"
+        return f"FrozenVec({Py_format_float(self._x)}, {Py_format_float(self._y)}, {Py_format_float(self._z)})"
 
-    def __reduce__(self) -> Tuple[Callable[[float, float, float], 'FrozenVec'], Tuple3]:
+    def __reduce__(self) -> tuple[Callable[[float, float, float], 'FrozenVec'], Tuple3]:
         """Pickling support.
 
         This redirects to a global function, so C/Python versions
@@ -1207,8 +1224,8 @@ class FrozenVec(VecBase):
     def cross(self: VecUnion, other: AnyVec) -> 'FrozenVec':
         """Return the cross product of both Vectors.
 
-        If this is called as a method (``a.cross(b)``), the result will have the
-        same type as ``a``. Otherwise, if called as ``Vec.cross(a, b)`` or ``FrozenVec.cross(a, b)``, the
+        If this is called as a method (:pycode:`a.cross(b)`), the result will have the
+        same type as ``a``. Otherwise, if called as :pycode:`Vec.cross(a, b)` or :pycode:`FrozenVec.cross(a, b)`, the
         type of the class takes priority.
         """
         return Py_FrozenVec(
@@ -1249,17 +1266,19 @@ class Vec(VecBase):
 
     Operators and comparisons will treat 3-tuples interchangably with vectors, which is more
     convenient when specifying constant values.
+
     >>> Vec(3, 8, 7) - (0, 3, 4)
     Vec(3, 5, 3)
 
     Addition/subtraction can be performed between either vectors or scalar values (applying equally
     to all axes). Multiplication/division must be performed between a vector and scalar to scale -
-    use `Vec.dot()` or `Vec.cross()` for those operations.
+    use `Vec.dot() <VecBase.dot>` or `Vec.cross()` for those operations.
 
     Values can be modified by either setting/getting `x`, `y` and `z` attributes.
     In addition, the following indexes are allowed (case-insensitive):
-    * `0`  `1`  `2`
-    * `"x"`, `"y"`, `"z"`
+
+    * ``0``  ``1``  ``2``
+    * ``"x"``, ``"y"``, ``"z"``
     """
     __slots__ = ()
 
@@ -1371,7 +1390,7 @@ class Vec(VecBase):
 
     def __repr__(self) -> str:
         """Code required to reproduce this vector."""
-        return f"Vec({format_float(self._x)}, {format_float(self._y)}, {format_float(self._z)})"
+        return f"Vec({Py_format_float(self._x)}, {Py_format_float(self._y)}, {Py_format_float(self._z)})"
 
     def freeze(self) -> FrozenVec:
         """Return an immutable version of this vector."""
@@ -1386,8 +1405,8 @@ class Vec(VecBase):
     def cross(self: VecUnion, other: AnyVec) -> 'Vec':
         """Return the cross product of both Vectors.
 
-        If this is called as a method (``a.cross(b)``), the result will have the
-        same type as ``a``. Otherwise, if called as ``Vec.cross(a, b)`` or ``FrozenVec.cross(a, b)``, the
+        If this is called as a method (:pycode:`a.cross(b)`), the result will have the
+        same type as ``a``. Otherwise, if called as :pycode:`Vec.cross(a, b)` or :pycode:`FrozenVec.cross(a, b)`, the
         type of the class takes priority.
         """
         return Py_Vec(
@@ -1397,12 +1416,12 @@ class Vec(VecBase):
         )
 
     if TYPE_CHECKING:
-        def __iadd__(self, other: Union['VecBase', Tuple3, int, float]) -> 'Vec': ...
-        def __isub__(self, other: Union['VecBase', Tuple3, int, float]) -> 'Vec': ...
-        def __imul__(self, other: float) -> 'Vec': ...
-        def __itruediv__(self, other: float) -> 'Vec': ...
-        def __ifloordiv__(self, other: float) -> 'Vec': ...
-        def __imod__(self, other: float) -> 'Vec': ...
+        def __iadd__(self, other: Union['VecBase', Tuple3, int, float]) -> Self: ...
+        def __isub__(self, other: Union['VecBase', Tuple3, int, float]) -> Self: ...
+        def __imul__(self, other: float) -> Self: ...
+        def __itruediv__(self, other: float) -> Self: ...
+        def __ifloordiv__(self, other: float) -> Self: ...
+        def __imod__(self, other: float) -> Self: ...
 
     _funcname = _op = _pretty = ''
     # Use exec() to generate all the number magic methods. This reduces code
@@ -1428,7 +1447,7 @@ class Vec(VecBase):
 
     del _funcname, _op, _pretty
 
-    def __imatmul__(self, other: Union['AngleBase', 'MatrixBase']) -> 'Vec':
+    def __imatmul__(self, other: Union['AngleBase', 'MatrixBase']) -> Self:
         """We need to define this, so it's in-place."""
         if isinstance(other, MatrixBase):
             mat = other
@@ -1440,7 +1459,7 @@ class Vec(VecBase):
         mat._vec_rot(self)
         return self
 
-    def __reduce__(self) -> Tuple[Callable[[float, float, float], 'Vec'], Tuple3]:
+    def __reduce__(self) -> tuple[Callable[[float, float, float], 'Vec'], Tuple3]:
         """Pickling support.
 
         This redirects to a global function, so C/Python versions
@@ -1474,7 +1493,7 @@ class Vec(VecBase):
     ) -> 'Vec':
         """Old method to rotate a vector by a Source rotational angle.
 
-        :deprecated: do ``Vec(...) @ Angle(...)`` instead.
+        :deprecated: use :pycode:`Vec(...) @ Angle(...)` instead.
 
         If round is True, all values will be rounded to 6 decimals
         (since these calculations always have small inprecision.)
@@ -1496,7 +1515,7 @@ class Vec(VecBase):
     ) -> 'Vec':
         """Rotate a vector, using a string instead of a vector.
 
-        :deprecated: use `Vec(...) @ Angle.from_str(...)` instead.
+        :deprecated: use :pycode:`Vec(...) @ Angle.from_str(...)` instead.
         """
         mat = Py_Matrix.from_angle(Py_Angle.from_str(ang, pitch, yaw, roll))
         # noinspection PyProtectedMember
@@ -1587,7 +1606,7 @@ class Vec(VecBase):
 
 
 # Maps (1, 1) -> ._bb attributes, for getting/setting by XY coordinate.
-_IND_TO_SLOT: Dict[Tuple[int, int], Literal[
+_IND_TO_SLOT: dict[tuple[int, int], Literal[
     '_aa', '_ab', '_ac',
     '_ba', '_bb', '_bc',
     '_ca', '_cb', '_cc',
@@ -1705,11 +1724,11 @@ class MatrixBase:
 
     @classmethod
     @overload
-    def from_angle(cls, __angle: 'AngleBase') -> Self: ...
+    def from_angle(cls, angle: 'AngleBase', /) -> Self: ...
 
     @classmethod
     @overload
-    def from_angle(cls, pitch: float, yaw: float, roll: float) -> Self: ...
+    def from_angle(cls, /, pitch: float, yaw: float, roll: float) -> Self: ...
 
     @classmethod
     def from_angle(
@@ -1779,7 +1798,7 @@ class MatrixBase:
         return cls.from_angle(pitch, yaw, roll)
 
     @classmethod
-    def axis_angle(cls, axis: Union[Vec, Tuple3], angle: float) -> Self:
+    def axis_angle(cls, axis: AnyVec, angle: float) -> Self:
         """Compute the rotation matrix forming a rotation around an axis by a specific angle."""
         x, y, z = Vec(axis).norm()
         # Invert, so it matches the orientation of Angles().
@@ -1816,7 +1835,7 @@ class MatrixBase:
         """Return a vector with the given magnitude pointing along the Z axis."""
         return Py_Vec(mag * self._ca, mag * self._cb, mag * self._cc)
 
-    def __getitem__(self, item: Tuple[int, int]) -> float:
+    def __getitem__(self, item: tuple[int, int]) -> float:
         """Retrieve an individual matrix value by x, y position (0-2)."""
         return cast(float, getattr(self, _IND_TO_SLOT[item]))
 
@@ -1832,7 +1851,7 @@ class MatrixBase:
 
         Internal, modifies the specified angle even if frozen -ensure it's new!
         """
-        # https://github.com/ValveSoftware/source-sdk-2013/blob/master/sp/src/mathlib/mathlib_base.cpp#L208
+        # https://github.com/ValveSoftware/source-sdk-2013/blob/0d8dceea4310fde5706b3ce1c70609d72a38efdf/sp/src/mathlib/mathlib_base.cpp#L208
         for_x = self._aa
         for_y = self._ab
         for_z = self._ac
@@ -1874,20 +1893,20 @@ class MatrixBase:
 
         # We're already in row major
         # Augment in an identity matrix
-        omat_l: List[Vec] = [
+        omat_l: list[Vec] = [
             Vec(self._aa, self._ab, self._ac),
             Vec(self._ba, self._bb, self._bc),
             Vec(self._ca, self._cb, self._cc),
         ]
-        omat_r: List[Vec] = [
+        omat_r: list[Vec] = [
             Vec(1, 0, 0),
             Vec(0, 1, 0),
             Vec(0, 0, 1),
         ]
 
         # Keep the matrix as references, so we can swap rows without damaging our matrix
-        mat_l: List[Vec] = [omat_l[0], omat_l[1], omat_l[2]]
-        mat_r: List[Vec] = [omat_r[0], omat_r[1], omat_r[2]]
+        mat_l: list[Vec] = [omat_l[0], omat_l[1], omat_l[2]]
+        mat_r: list[Vec] = [omat_r[0], omat_r[1], omat_r[2]]
 
         # Get it into row echelon form
         for n in [0, 1]:
@@ -2053,7 +2072,7 @@ class MatrixBase:
         vec._y = (x * self._ab) + (y * self._bb) + (z * self._cb)
         vec._z = (x * self._ac) + (y * self._bc) + (z * self._cc)
 
-    def __matmul__(self, other: 'MatrixBase | AngleBase') -> Self:
+    def __matmul__(self, other: 'Matrix | FrozenMatrix | Angle | FrozenAngle') -> Self:
         if isinstance(other, MatrixBase):
             mat = self.copy()
             mat._mat_mul(other)
@@ -2143,13 +2162,13 @@ class FrozenMatrix(MatrixBase):
 
     __copy__ = copy
 
-    def __deepcopy__(self, memodict: Optional[Dict[str, Any]] = None) -> 'FrozenMatrix':
+    def __deepcopy__(self, memodict: dict[int, Any]) -> 'FrozenMatrix':
         """Frozen matrices are immutable."""
         return self
 
-    def __reduce__(self) -> Tuple[
+    def __reduce__(self) -> tuple[
         Callable[[float, float, float, float, float, float, float, float, float], 'FrozenMatrix'],
-        Tuple[float, float, float, float, float, float, float, float, float]
+        tuple[float, float, float, float, float, float, float, float, float]
     ]:
         """Pickling support.
 
@@ -2209,7 +2228,7 @@ class Matrix(MatrixBase):
 
     __copy__ = copy
 
-    def __deepcopy__(self, memodict: Optional[Dict[str, Any]] = None) -> 'Matrix':
+    def __deepcopy__(self, memodict: dict[int, Any]) -> 'Matrix':
         """Duplicate this matrix."""
         rot = Py_Matrix.__new__(Py_Matrix)
 
@@ -2219,9 +2238,9 @@ class Matrix(MatrixBase):
 
         return rot
 
-    def __reduce__(self) -> Tuple[
+    def __reduce__(self) -> tuple[
         Callable[[float, float, float, float, float, float, float, float, float], 'Matrix'],
-        Tuple[float, float, float, float, float, float, float, float, float]
+        tuple[float, float, float, float, float, float, float, float, float]
     ]:
         """Pickling support.
 
@@ -2234,11 +2253,11 @@ class Matrix(MatrixBase):
             self._ca, self._cb, self._cc
         ))
 
-    def __setitem__(self, item: Tuple[int, int], value: Numeric) -> None:
+    def __setitem__(self, item: tuple[int, int], value: Numeric) -> None:
         """Set an individual matrix value by x, y position (0-2)."""
         setattr(self, _IND_TO_SLOT[item], _coerce_float(value))
 
-    def __imatmul__(self, other: 'MatrixBase | AngleBase') -> 'Matrix':
+    def __imatmul__(self, other: 'MatrixBase | AngleBase') -> Self:
         if isinstance(other, MatrixBase):
             self._mat_mul(other)
             return self
@@ -2318,14 +2337,14 @@ class AngleBase:
 
     @classmethod
     @overload
-    def with_axes(cls, axis1: str, val1: Union[float, 'AngleBase']) -> Self: ...
+    def with_axes(cls, axis1: str, val1: Union[Numeric, 'AngleBase']) -> Self: ...
 
     @classmethod
     @overload
     def with_axes(
         cls,
-        axis1: str, val1: Union[float, 'AngleBase'],
-        axis2: str, val2: Union[float, 'AngleBase'],
+        axis1: str, val1: Union[Numeric, 'AngleBase'],
+        axis2: str, val2: Union[Numeric, 'AngleBase'],
     ) -> Self:
         ...
 
@@ -2333,17 +2352,17 @@ class AngleBase:
     @overload
     def with_axes(
         cls,
-        axis1: str, val1: Union[float, 'AngleBase'],
-        axis2: str, val2: Union[float, 'AngleBase'],
-        axis3: str, val3: Union[float, 'AngleBase'],
+        axis1: str, val1: Union[Numeric, 'AngleBase'],
+        axis2: str, val2: Union[Numeric, 'AngleBase'],
+        axis3: str, val3: Union[Numeric, 'AngleBase'],
     ) -> Self:
         ...
 
     @classmethod
     def with_axes(
         cls,
-        *args: Union[str, float, 'AngleBase'],
-        **kwargs: Union[str, float, 'AngleBase'],
+        *args: Union[str, Numeric, 'AngleBase'],
+        **kwargs: Union[str, Numeric, 'AngleBase'],
     ) -> Self:
         """Create an Angle, given a number of axes and corresponding values.
 
@@ -2364,7 +2383,7 @@ class AngleBase:
 
         This strips off the .0 if no decimal portion exists.
         """
-        return f'{format_float(self._pitch)}{delim}{format_float(self._yaw)}{delim}{format_float(self._roll)}'
+        return f'{Py_format_float(self._pitch)}{delim}{Py_format_float(self._yaw)}{delim}{Py_format_float(self._roll)}'
 
     def __str__(self) -> str:
         """Return the values, separated by spaces.
@@ -2373,7 +2392,7 @@ class AngleBase:
         vectors.
         This strips off the .0 if no decimal portion exists.
         """
-        return f"{format_float(self._pitch)} {format_float(self._yaw)} {format_float(self._roll)}"
+        return f"{Py_format_float(self._pitch)} {Py_format_float(self._yaw)} {Py_format_float(self._roll)}"
 
     def __format__(self, format_spec: str) -> str:
         """Control how the text is formatted."""
@@ -2393,7 +2412,7 @@ class AngleBase:
             roll = roll.rstrip('0')
         return f'{pitch.rstrip(".")} {yaw.rstrip(".")} {roll.rstrip(".")}'
 
-    def as_tuple(self) -> Tuple[float, float, float]:
+    def as_tuple(self) -> tuple[float, float, float]:
         """Return the Angle as a tuple."""
         return Vec_tuple(self._pitch, self._yaw, self._roll)
 
@@ -2503,7 +2522,7 @@ class AngleBase:
             )
         return NotImplemented
 
-    def _rotate_angle(self, target: 'AngleBase', cls: Type[AngleT]) -> AngleT:
+    def _rotate_angle(self, target: 'AngleBase', cls: type[AngleT]) -> AngleT:
         """Rotate the target by this angle.
 
         Inefficient if we have more than one rotation to do.
@@ -2566,7 +2585,7 @@ class FrozenAngle(AngleBase):
         # Already a FrozenVec.
         if isinstance(pitch, cls):
             return pitch
-        res = object.__new__(cls)
+        res: FrozenAngle = object.__new__(cls)
         if isinstance(pitch, (int, float)):
             res._pitch = float(pitch) % 360.0 % 360.0
             res._yaw = float(yaw) % 360.0 % 360.0
@@ -2585,34 +2604,34 @@ class FrozenAngle(AngleBase):
 
     @classmethod
     @overload
-    def with_axes(cls, axis1: str, val1: Union[float, AngleBase]) -> 'FrozenAngle': ...
+    def with_axes(cls, axis1: str, val1: Union[Numeric, AngleBase]) -> 'FrozenAngle': ...
 
     @classmethod
     @overload
     def with_axes(
         cls,
-        axis1: str, val1: Union[float, AngleBase],
-        axis2: str, val2: Union[float, AngleBase],
+        axis1: str, val1: Union[Numeric, AngleBase],
+        axis2: str, val2: Union[Numeric, AngleBase],
     ) -> 'FrozenAngle': ...
 
     @classmethod
     @overload
     def with_axes(
         cls,
-        axis1: str, val1: Union[float, AngleBase],
-        axis2: str, val2: Union[float, AngleBase],
-        axis3: str, val3: Union[float, AngleBase],
+        axis1: str, val1: Union[Numeric, AngleBase],
+        axis2: str, val2: Union[Numeric, AngleBase],
+        axis3: str, val3: Union[Numeric, AngleBase],
     ) -> 'FrozenAngle': ...
 
     @classmethod
     def with_axes(
         cls,
         axis1: str,
-        val1: Union[float, AngleBase],
+        val1: Union[Numeric, AngleBase],
         axis2: Optional[str] = None,
-        val2: Union[float, AngleBase] = 0.0,
+        val2: Union[Numeric, AngleBase] = 0.0,
         axis3: Optional[str] = None,
-        val3: Union[float, AngleBase] = 0.0,
+        val3: Union[Numeric, AngleBase] = 0.0,
     ) -> 'FrozenAngle':
         """Create an Angle, given a number of axes and corresponding values.
 
@@ -2643,7 +2662,7 @@ class FrozenAngle(AngleBase):
                     res[axis3] = _coerce_float(val3)
         return Py_FrozenAngle(**res)
 
-    def __reduce__(self) -> Tuple[Callable[[float, float, float], 'FrozenAngle'], Tuple3]:
+    def __reduce__(self) -> tuple[Callable[[float, float, float], 'FrozenAngle'], Tuple3]:
         """Pickling support.
 
         This redirects to a global function, so C/Python versions
@@ -2671,12 +2690,12 @@ class FrozenAngle(AngleBase):
         """FrozenAngle is immutable."""
         return self
 
-    def __deepcopy__(self, memodict: Optional[Dict[str, Any]] = None) -> 'FrozenAngle':
+    def __deepcopy__(self, memodict: dict[int, Any]) -> 'FrozenAngle':
         """FrozenAngle is immutable."""
         return self
 
     def __repr__(self) -> str:
-        return f"FrozenAngle({format_float(self._pitch)}, {format_float(self._yaw)}, {format_float(self._roll)})"
+        return f"FrozenAngle({Py_format_float(self._pitch)}, {Py_format_float(self._yaw)}, {Py_format_float(self._roll)})"
 
 
 @final
@@ -2742,7 +2761,7 @@ class Angle(AngleBase):
 
     __copy__ = copy
 
-    def __reduce__(self) -> Tuple[Callable[[float, float, float], 'Angle'], Tuple3]:
+    def __reduce__(self) -> tuple[Callable[[float, float, float], 'Angle'], Tuple3]:
         """Pickling support.
 
         This redirects to a global function, so C/Python versions
@@ -2786,19 +2805,19 @@ class Angle(AngleBase):
         self._roll = float(roll) % 360 % 360
 
     def __repr__(self) -> str:
-        return f'Angle({format_float(self._pitch)}, {format_float(self._yaw)}, {format_float(self._roll)})'
+        return f'Angle({Py_format_float(self._pitch)}, {Py_format_float(self._yaw)}, {Py_format_float(self._roll)})'
 
     @classmethod
     @overload
-    def with_axes(cls, axis1: str, val1: Union[float, AngleBase]) -> 'Angle':
+    def with_axes(cls, axis1: str, val1: Union[Numeric, AngleBase]) -> 'Angle':
         ...
 
     @classmethod
     @overload
     def with_axes(
         cls,
-        axis1: str, val1: Union[float, AngleBase],
-        axis2: str, val2: Union[float, AngleBase],
+        axis1: str, val1: Union[Numeric, AngleBase],
+        axis2: str, val2: Union[Numeric, AngleBase],
     ) -> 'Angle':
         ...
 
@@ -2806,9 +2825,9 @@ class Angle(AngleBase):
     @overload
     def with_axes(
         cls,
-        axis1: str, val1: Union[float, AngleBase],
-        axis2: str, val2: Union[float, AngleBase],
-        axis3: str, val3: Union[float, AngleBase],
+        axis1: str, val1: Union[Numeric, AngleBase],
+        axis2: str, val2: Union[Numeric, AngleBase],
+        axis3: str, val3: Union[Numeric, AngleBase],
     ) -> 'Angle':
         ...
 
@@ -2816,11 +2835,11 @@ class Angle(AngleBase):
     def with_axes(
         cls,
         axis1: str,
-        val1: Union[float, AngleBase],
+        val1: Union[Numeric, AngleBase],
         axis2: Optional[str] = None,
-        val2: Union[float, AngleBase] = 0.0,
+        val2: Union[Numeric, AngleBase] = 0.0,
         axis3: Optional[str] = None,
-        val3: Union[float, AngleBase] = 0.0,
+        val3: Union[Numeric, AngleBase] = 0.0,
     ) -> 'Angle':
         """Create an Angle, given a number of axes and corresponding values.
 
@@ -2861,7 +2880,7 @@ class Angle(AngleBase):
         else:
             raise KeyError(f'Invalid axis: {ind!r}')
 
-    def __imul__(self, other: Union[int, float]) -> 'Angle':
+    def __imul__(self, other: Union[int, float]) -> Self:
         """Angle ``*=`` float multiplies each value."""
         if isinstance(other, (int, float)):
             self._pitch = self._pitch * other % 360.0 % 360.0
@@ -2871,7 +2890,7 @@ class Angle(AngleBase):
         return NotImplemented
 
     # noinspection PyProtectedMember
-    def __imatmul__(self, other: Union[AngleBase, MatrixBase]) -> 'Angle':
+    def __imatmul__(self, other: Union[AngleBase, MatrixBase]) -> Self:
         """Angle ``@`` Angle or Angle ``@`` Matrix rotates the first by the second."""
         if isinstance(other, AngleBase):
             mat = Py_Matrix.from_angle(self)
@@ -2900,7 +2919,7 @@ class Angle(AngleBase):
         self._roll = new_ang._roll
 
 
-def quickhull(vertexes: Iterable[Vec]) -> List[Tuple[Vec, Vec, Vec]]:
+def quickhull(vertexes: Iterable[AnyVec]) -> list[tuple[Vec, Vec, Vec]]:
     """Use the quickhull algorithm to construct a convex hull around the provided points.
 
     This is only available when the C extension is compiled.
@@ -2997,31 +3016,34 @@ _mk = _mk_vec
 # A little dance to preserve both the Cython and Python versions,
 # and choose an appropriate unprefixed version. Static analysis then
 # also assumes all three are the Python version.
+# These are mainly for testing.
 
-Cy_Vec: TypeAlias = Vec
-Py_Vec: TypeAlias = Vec
-Cy_FrozenVec: TypeAlias = FrozenVec
-Py_FrozenVec: TypeAlias = FrozenVec
-Cy_VecBase: TypeAlias = VecBase
-Py_VecBase: TypeAlias = VecBase
-Cy_Angle: TypeAlias = Angle
-Py_Angle: TypeAlias = Angle
-Cy_FrozenAngle: TypeAlias = FrozenAngle
-Py_FrozenAngle: TypeAlias = FrozenAngle
-Cy_AngleBase: TypeAlias = AngleBase
-Py_AngleBase: TypeAlias = AngleBase
-Cy_Matrix: TypeAlias = Matrix
-Py_Matrix: TypeAlias = Matrix
-Cy_FrozenMatrix: TypeAlias = FrozenMatrix
-Py_FrozenMatrix: TypeAlias = FrozenMatrix
-Cy_MatrixBase: TypeAlias = MatrixBase
-Py_MatrixBase: TypeAlias = MatrixBase
+Cy_Vec = Vec
+Py_Vec = Vec
+Cy_FrozenVec = FrozenVec
+Py_FrozenVec = FrozenVec
+Cy_VecBase = VecBase
+Py_VecBase = VecBase
+Cy_Angle = Angle
+Py_Angle = Angle
+Cy_FrozenAngle = FrozenAngle
+Py_FrozenAngle = FrozenAngle
+Cy_AngleBase = AngleBase
+Py_AngleBase = AngleBase
+Cy_Matrix = Matrix
+Py_Matrix = Matrix
+Cy_FrozenMatrix = FrozenMatrix
+Py_FrozenMatrix = FrozenMatrix
+Cy_MatrixBase = MatrixBase
+Py_MatrixBase = MatrixBase
 Cy_parse_vec_str = parse_vec_str
 Py_parse_vec_str = parse_vec_str
 Cy_to_matrix = to_matrix
 Py_to_matrix = to_matrix
 Cy_lerp = lerp
 Py_lerp = lerp
+Py_format_float = format_float
+Cy_format_float = format_float
 
 # Do it this way, so static analysis ignores this.
 if not TYPE_CHECKING:
@@ -3038,4 +3060,9 @@ if not TYPE_CHECKING:
             'parse_vec_str', 'to_matrix', 'lerp', 'format_float',
         ]:
             _glob[_name] = _glob['Cy_' + _name] = getattr(_math, _name)
+        # Don't have a pure-py version, so we don't need to preserve.
+        quickhull = _math.quickhull
         del _glob, _name, _math
+
+# Then import PointsMap, so it gets the right Vector implementation.
+from srctools._points_map import PointsMap as PointsMap

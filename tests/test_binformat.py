@@ -1,5 +1,3 @@
-from typing import List
-
 import pytest
 
 from srctools import binformat
@@ -10,10 +8,10 @@ from srctools import binformat
     ([1, 2, 4, 38], 12, 4),
     ([3, 4, 5, 4], 4, 3),
 ])
-def test_find_or_insert(original: List[int], item: int, index: int) -> None:
+def test_find_or_insert(original: list[int], item: int, index: int) -> None:
     """Test the find-or-insert helper function correctly inserts values."""
     array = original.copy()
-    finder = binformat.find_or_insert(array, lambda x: -x)
+    finder = binformat.find_or_insert(array, lambda x: x * 3)
     assert finder(item) == index
     assert finder(item) == index  # Doesn't repeat.
     assert array[index] == item  # And put it in that spot.
@@ -26,7 +24,7 @@ def test_find_or_insert(original: List[int], item: int, index: int) -> None:
     (['a', 'b', 'c'], ['j', 'k'], 3),
     (['a', 'c', 'e', 'f', 'g', 'c', 'e', 'a', 'k'], ['c', 'e', 'a'], 5),
 ])
-def test_find_or_extend(original: List[str], subset: List[str], start: int) -> None:
+def test_find_or_extend(original: list[str], subset: list[str], start: int) -> None:
     """Test the find-or-extend helper function correctly inserts a subset."""
     array = original.copy()
     finder = binformat.find_or_extend(array, str.swapcase)

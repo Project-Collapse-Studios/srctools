@@ -1,5 +1,15 @@
 """Test packlist logic."""
-from srctools.packlist import strip_extension
+from typing import Union
+
+from collections.abc import Mapping
+
+from dirty_equals import IsList
+
+from srctools import EmptyMapping
+from srctools.vmf import VMF
+from srctools.const import FileType
+from srctools.filesys import FileSystemChain, VirtualFileSystem
+from srctools.packlist import strip_extension, PackList
 
 
 def test_strip_extensions() -> None:
@@ -8,3 +18,279 @@ def test_strip_extensions() -> None:
     assert strip_extension('directory/../file') == 'directory/../file'
     assert strip_extension('directory/../file.extension') == 'directory/../file'
     assert strip_extension('directory.dotted/filename') == 'directory.dotted/filename'
+
+
+# -------------------------------------------------------
+# Test packing, by using various representative entities.
+# -------------------------------------------------------
+
+def packing_test(
+    vmf: VMF,
+    files: Mapping[str, Union[str, bytes]] = EmptyMapping,
+) -> tuple[PackList, list[tuple[FileType, str]]]:
+    """Pack ents in a VMF, then return the files for checking packing logic."""
+    fsys = FileSystemChain()
+    if files is not EmptyMapping:
+        fsys.add_sys(VirtualFileSystem(files))
+    packlist = PackList(fsys)
+    packlist.load_manifests()
+    packlist.pack_from_ents(vmf, 'some_map')
+    return packlist, [(file.type, file.filename) for file in packlist]
+
+
+def test_valtype_basic() -> None:
+    """Test npc_sniper, to check various basic types with no special behaviour."""
+    vmf = VMF()
+    vmf.create_ent(
+        'npc_sniper',
+        targetname='a_sniper',  # target_source
+        vscripts='first.nut second',  # vscript_list
+        origin='128 0 96',  # Origin
+        angles='0 90 10',  # Angle
+        radius=3.8,  # Float
+        spawnflags=1024,  # Spawnflags
+        beambrightness=15,  # Int
+        shootzombiesinchest=True,  # Boolean
+        beamcolor='255 100 125',  # Color255
+        relationship='npc_alyx D_LI 9',  # String
+        enemyfilter='some_filter',  # filterclass
+        lightingorigin='sniper_light',  # target_destination
+        velocity='0 0 50',  # Vector
+    )
+    packlist, files = packing_test(vmf)
+    assert files == IsList(  # These are all npc_sniper default resources.
+        (FileType.VSCRIPT_SQUIRREL, 'scripts/vscripts/first.nut'),
+        (FileType.VSCRIPT_SQUIRREL, 'scripts/vscripts/second.nut'),
+        (FileType.MATERIAL, 'materials/effects/bluelaser1.vmt'),
+        (FileType.MATERIAL, 'materials/sprites/muzzleflash1.vmt'),
+        (FileType.MATERIAL, 'materials/sprites/light_glow03.vmt'),
+        (FileType.MODEL, 'models/combine_soldier.mdl'),
+        check_order=False,
+    )
+
+
+def test_valtype_axis() -> None:
+    """Test prop_door_rotating, for the AXIS type."""
+    vmf = VMF()
+    vmf.create_ent(
+        'prop_door_rotating',
+        axis='32 0 48, 32 84 48',
+        # Don't set model, we'll test that in class resources.
+    )
+    packlist, files = packing_test(vmf)
+    assert files == []
+
+
+def test_valtype_choreo() -> None:
+    """Test logic_choreographed_scene, for the CHOREO types."""
+    vmf = VMF()
+    vmf.create_ent(
+        'logic_choreographed_scene',
+        scenefile='character/player/talk.vcd',
+        resumescenefile='generic/swap.vcd',
+    )
+    packlist, files = packing_test(vmf)
+    assert files == IsList(
+        (FileType.CHOREO, 'character/player/talk.vcd'),
+        (FileType.CHOREO, 'generic/swap.vcd'),
+        check_order=False,
+    )
+
+
+def test_valtype_model_sound() -> None:
+    """Test prop_physics, for the MODEL and SOUND types."""
+    vmf = VMF()
+    vmf.create_ent(
+        'prop_physics',
+        model="models/props/magic.mdl",
+        puntsound="#)explosion.wav",
+    )
+    packlist, files = packing_test(vmf)
+    assert (FileType.MODEL, "models/props/magic.mdl") in files, list(packlist)
+    assert (FileType.RAW_SOUND, "sound/explosion.wav") in files, list(packlist)
+
+
+def test_valtype_npc_class() -> None:
+    """Test scripted_target, for the NPC_CLASS type."""
+    vmf = VMF()
+    vmf.create_ent(
+        'scripted_target',
+        m_iszentity='npc_alyx',
+    )
+    packlist, files = packing_test(vmf)
+    assert files == []
+
+
+def test_valtype_soundscript() -> None:
+    """Test ambient_generic, for soundscripts."""
+    vmf = VMF()
+    vmf.create_ent('ambient_generic', message='test.some_sound')
+    fsys = {
+        'scripts/game_sounds_manifest.txt': '''
+"game_sounds_manifest"
+    {
+    "precache_file" "scripts/soundscript.txt"
+    }
+''',
+        'scripts/soundscript.txt': '''
+"test.some_sound"
+    {
+    "channel" "CHAN_STATIC"
+    "volume"  "VOL_NORM"
+    "wave"	  "ambient/playonce/sound.wav"
+    }
+'''
+    }
+    packlist, files = packing_test(vmf, fsys)
+    assert files == IsList(
+        (FileType.RAW_SOUND, 'sound/ambient/playonce/sound.wav'),
+        (FileType.SOUNDSCRIPT, 'scripts/soundscript.txt'),
+        check_order=False,
+    ), list(packlist)
+
+
+def test_valtype_soundscape() -> None:
+    """Test env_soundscape, for soundscapes."""
+    vmf = VMF()
+    vmf.create_ent('env_soundscape', soundscape='test.some_scape')
+    fsys = {
+        'scripts/soundscapes_manifest.txt': '''
+"soundscapes_manifest"
+    {
+    "file" "scripts/soundscape.txt"
+    }
+''',
+        'scripts/soundscape.txt': '''
+"test.some_scape"
+    {
+    playlooping
+        {
+        wave "ambient/loop_sound.mp3"
+        }
+    playsoundscape
+        {
+        name test.another_scape
+        }
+    playrandom
+        {
+        rndwave
+            {
+            wave "ambient/rand_1.wav"
+            wave ambient/rand_2.wav
+            }
+        }
+    }
+"test.another_scape"
+    {
+    "playlooping"
+        {
+        "wave" "ambient/sub_sound.wav"
+        }
+    }
+'''
+    }
+    packlist, files = packing_test(vmf, fsys)
+    assert files == IsList(
+        (FileType.RAW_SOUND, 'sound/ambient/loop_sound.mp3'),
+        (FileType.RAW_SOUND, 'sound/ambient/sub_sound.wav'),
+        (FileType.RAW_SOUND, 'sound/ambient/rand_1.wav'),
+        (FileType.RAW_SOUND, 'sound/ambient/rand_2.wav'),
+        (FileType.SOUNDSCAPE_FILE, 'scripts/soundscape.txt'),
+        check_order=False,
+    ), list(packlist)
+
+
+def test_valtype_texture() -> None:
+    """Test env_projectedtexture, for the TEXTURE type."""
+    vmf = VMF()
+    vmf.create_ent(
+        'env_projectedtexture',
+        texturename="effects/FLashlight001",
+    )
+    packlist, files = packing_test(vmf)
+    assert (FileType.TEXTURE, "materials/effects/flashlight001.vtf") in files, list(packlist)
+
+
+def test_valtype_material() -> None:
+    """Test move_rope, for the TEXTURE type."""
+    vmf = VMF()
+    vmf.create_ent(
+        'move_rope',
+        ropematerial="cable/chain",
+    )
+    packlist, files = packing_test(vmf)
+    assert (FileType.MATERIAL, "materials/cable/chain.vmt") in files, list(packlist)
+
+
+def test_valtype_sprite() -> None:
+    """Test env_beam, for the SPRITE type."""
+    vmf = VMF()
+    vmf.create_ent(
+        'env_beam',
+        rendercolor="0 200 200",
+        BoltWidth="6",
+        texture="folder/FANCY_beam.vmt",
+    )
+    vmf.create_ent(
+        'env_beam',
+        rendercolor="0 200 200",
+        BoltWidth="6",
+        texture="folder/LEGacy_sprite.spr",
+    )
+    packlist, files = packing_test(vmf)
+    assert (FileType.MATERIAL, "materials/folder/fancy_beam.vmt") in files, list(packlist)
+    assert (FileType.MATERIAL, "materials/sprites/folder/legacy_sprite.vmt") in files, list(packlist)
+
+
+def test_valtype_decal() -> None:
+    """Test infodecal, for the DECAL type."""
+    vmf = VMF()
+    vmf.create_ent(
+        'infodecal',
+        texture="decals/decal_crater001a",
+    )
+    packlist, files = packing_test(vmf)
+    assert files == IsList(
+        (FileType.MATERIAL, "materials/decals/decal_crater001a.vmt"),
+        check_order=False,
+    )
+
+
+def test_valtype_overlay() -> None:
+    """Test info_overlay, for several vector types."""
+    vmf = VMF()
+    vmf.create_ent(
+        'info_overlay',
+        material="overlays/some_sign",
+        sides='1 82 95',  # sidelist
+        basisorigin='0 0 0',  # vector
+        basisnormal='0 0 1',  # vec_dir
+        uv0='-16 -16 0',  # vec_local
+    )
+    packlist, files = packing_test(vmf)
+    assert files == IsList(
+        (FileType.MATERIAL, "materials/overlays/some_sign.vmt"),
+        check_order=False,
+    )
+
+
+def test_valtype_color1() -> None:
+    """Test env_skypaint, for the COLOR1 type."""
+    vmf = VMF()
+    vmf.create_ent(
+        'env_skypaint',
+        topcolor='1 0 0.2 0.875',
+    )
+    packlist, files = packing_test(vmf)
+    assert files == []
+
+
+def test_valtype_vecline() -> None:
+    """Test phys_motor, for the VECLINE type."""
+    vmf = VMF()
+    vmf.create_ent(
+        'phys_motor',
+        axis='32 0 48, 32 84 48',
+    )
+    packlist, files = packing_test(vmf)
+    assert files == []

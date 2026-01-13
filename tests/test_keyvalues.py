@@ -1,20 +1,24 @@
 """Test the keyvalues module."""
-from typing import Generator, List, Type, Union
+from typing import Union
+from collections.abc import Generator
+from unittest.mock import Mock
 import itertools
+import sys
 
-from exceptiongroup import ExceptionGroup
 import pytest
 
 from srctools import keyvalues as kv_mod
 from srctools.keyvalues import KeyValError, Keyvalues, LeafKeyvalueError, NoKeyError
 # noinspection PyProtectedMember
 from srctools.tokenizer import (
-    Cy_BaseTokenizer, Cy_Tokenizer, Py_BaseTokenizer, Py_Tokenizer,
-    Tokenizer, Token,
+    Cy_BaseTokenizer, Cy_Tokenizer, Py_BaseTokenizer, Py_Tokenizer, Token, Tokenizer,
 )
 
+if sys.version_info < (3, 11):
+    from exceptiongroup import ExceptionGroup
 
-if Cy_Tokenizer is not None:
+
+if Cy_Tokenizer is not Py_Tokenizer:
     parms = [(Cy_Tokenizer, Cy_BaseTokenizer), (Py_Tokenizer, Py_BaseTokenizer)]
     ids = ['Cython tokenizer', 'Python tokenizer']
 else:
@@ -24,14 +28,14 @@ else:
 
 
 @pytest.fixture(params=parms, ids=ids)
-def py_c_token(request) -> Generator[Type[Tokenizer], None, None]:
+def py_c_token(request: pytest.FixtureRequest) -> Generator[type[Tokenizer], None, None]:
     """Run the test twice, for the Python and C versions of Tokenizer."""
-    orig_tok = kv_mod.Tokenizer, kv_mod.BaseTokenizer
+    orig_tok = kv_mod.Tokenizer, kv_mod.BaseTokenizer  # type: ignore[attr-defined]
     try:
-        kv_mod.Tokenizer, kv_mod.BaseTokenizer = request.param
+        kv_mod.Tokenizer, kv_mod.BaseTokenizer = request.param  # type: ignore[attr-defined]
         yield request.param[0]
     finally:
-        kv_mod.Tokenizer, kv_mod.BaseTokenizer = orig_tok
+        kv_mod.Tokenizer, kv_mod.BaseTokenizer = orig_tok  # type: ignore[attr-defined]
 
 
 def assert_tree(first: Keyvalues, second: Keyvalues, path: str = '') -> None:
@@ -109,7 +113,9 @@ def test_names() -> None:
     with pytest.deprecated_call(match='[rR]oot [kK]eyvalues'):
         prop.name = None  # type: ignore
     with pytest.deprecated_call(match='[rR]oot [kK]eyvalues'):
-        assert prop.name is prop.real_name is None
+        assert prop.name is None  # type: ignore
+    with pytest.deprecated_call(match='[rR]oot [kK]eyvalues'):
+        assert prop.real_name is None
 
 # If edited, update test_parse() and tokeniser check too!
 parse_test = '''
@@ -245,7 +251,7 @@ parse_result = Keyvalues.root(
 del P
 
 
-def test_parse(py_c_token: Type[Tokenizer]) -> None:
+def test_parse(py_c_token: type[Tokenizer]) -> None:
     """Test parsing strings."""
     result = Keyvalues.parse(
         # iter() ensures sequence methods aren't used anywhere.
@@ -309,7 +315,15 @@ def test_lineno() -> None:
     assert raises.value.filename is None
 
 
-def test_single_block(py_c_token: Type[Tokenizer]) -> None:
+def test_periodic_callback(py_c_token: type[Tokenizer]) -> None:
+    """Test the periodic callback function. The specific delay is not specified."""
+    cb = Mock()
+    Keyvalues.parse(parse_test, periodic_callback=cb)
+    # Check the number of calls hasn't changed, number is arbitrary.
+    assert len(cb.mock_calls) == 8
+
+
+def test_single_block(py_c_token: type[Tokenizer]) -> None:
     """Test the single_block option for parsing."""
     tokenizer = py_c_token(parse_test, string_bracket=True)
     # Skip to the root2 section.
@@ -358,7 +372,7 @@ def test_apply_filename() -> None:
     outer_group = ExceptionGroup('outer', [
         val_err := ValueError('unrelated'),
         outer_err := NoKeyError('OuterKey', 12),
-        inner_group := ExceptionGroup('inner', [
+        ExceptionGroup('inner', [
             already_set := NoKeyError('AlreadySet', 14, 'another.kv'),
             inner_err := NoKeyError('InnerKey', 48),
         ]),
@@ -460,7 +474,7 @@ def test_build_exc() -> None:
     ]), prop)
 
 
-def test_parse_fails(py_c_token: Type[Tokenizer]) -> None:
+def test_parse_fails(py_c_token: type[Tokenizer]) -> None:
     """Test various forms of invalid syntax to ensure they indeed fail."""
     def t(text: str) -> None:
         """Test a string to ensure it fails parsing."""
@@ -620,7 +634,7 @@ text with
     ''')
 
 
-def test_newline_strings(py_c_token: Type[Tokenizer]) -> None:
+def test_newline_strings(py_c_token: type[Tokenizer]) -> None:
     """Test that newlines are correctly blocked if the parameter is set."""
     with pytest.raises(KeyValError):
         Keyvalues.parse('"key\nmultiline" "value"')
@@ -734,7 +748,7 @@ def test_edit() -> None:
     """Check functionality of Keyvalues.edit()"""
     test_prop = Keyvalues('Name', 'Value')
 
-    def check(prop: Keyvalues, name: str, value: Union[str, List[str]]) -> None:
+    def check(prop: Keyvalues, name: str, value: Union[str, list[str]]) -> None:
         """Check the property was edited, and has the given value."""
         nonlocal test_prop
         assert prop is test_prop
@@ -813,7 +827,7 @@ def test_blockfuncs_fail_on_leaf() -> None:
     with pytest.raises(LeafKeyvalueError):
         leaf.ensure_exists('blah')
     with pytest.raises(LeafKeyvalueError):
-        leaf.set_key(("blah", "another"), 45)
+        leaf.set_key(("blah", "another"), 45)  # type: ignore
     with pytest.raises(LeafKeyvalueError):
         leaf.merge_children()
 

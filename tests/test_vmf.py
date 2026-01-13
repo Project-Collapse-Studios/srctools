@@ -1,13 +1,15 @@
 """Tests for the VMF library."""
 from typing import Optional
 from enum import Enum
+import re
 
 from dirty_equals import IsList
 from pytest_regressions.file_regression import FileRegressionFixture
 import pytest
 
 from helpers import ExactType
-from srctools import Angle, FrozenAngle, FrozenMatrix, FrozenVec, Keyvalues, Matrix, Vec
+from srctools.keyvalues import Keyvalues
+from srctools.math import Angle, FrozenAngle, FrozenMatrix, FrozenVec, Matrix, Vec
 from srctools.vmf import (
     VMF, Axis, Entity, Output, Strata2DViewport, Strata3DViewport,
     StrataInstanceVisibility, conv_kv,
@@ -105,7 +107,7 @@ def test_entkey_basic() -> None:
     internal_keys = ent._keys  # noqa
     assert len(ent) == 1
     assert list(ent) == ['classname']
-    with pytest.warns(DeprecationWarning):
+    with pytest.warns(DeprecationWarning, match=re.escape('use the entity as a mapping')):
         assert list(ent.keys()) == ['classname']
     assert list(ent.values()) == ['info_null']
     assert list(ent.items()) == [('classname', 'info_null')]
@@ -141,7 +143,7 @@ def test_entkey_basic() -> None:
         'classname', 'target', 'health', 'Range', 'allowRespawn', 'canKill', 'movedirection',
         check_order=False,
     )
-    with pytest.warns(DeprecationWarning):
+    with pytest.warns(DeprecationWarning, match=re.escape('use the entity as a mapping')):
         keys = ent.keys()
     assert list(keys) == IsList(
         'classname', 'target', 'health', 'Range', 'allowRespawn', 'canKill', 'movedirection',
@@ -329,21 +331,21 @@ def test_fixup_containment() -> None:
     assert '$test' in ent.fixup.keys()
     assert 'fAlSe' in ent.fixup.keys()
     assert '' not in ent.fixup.keys()
-    assert ValueError not in ent.fixup.keys()
+    assert ValueError not in ent.fixup.keys()  # type: ignore[comparison-overlap]
 
     assert '1' in ent.fixup.values()
     assert '45.75' in ent.fixup.values()
     assert '' not in ent.fixup.values()
     assert 'false' not in ent.fixup.values()
-    assert ValueError not in ent.fixup.values()
+    assert ValueError not in ent.fixup.values()  # type: ignore[comparison-overlap]
 
     assert ('$true', '1') in ent.fixup.items()
     assert ('VaLuE', '45.75') in ent.fixup.items()
     assert ('$true', '0') not in ent.fixup.items()
-    assert ('FaLse', object) not in ent.fixup.items()
+    assert ('FaLse', object) not in ent.fixup.items()  # type: ignore[comparison-overlap]
     assert ('', 'test') not in ent.fixup.items()
-    assert ('false', ) not in ent.fixup.items()
-    assert ValueError not in ent.fixup.items()
+    assert ('false', ) not in ent.fixup.items()  # type: ignore[operator]
+    assert ValueError not in ent.fixup.items()  # type: ignore[operator]
 
 
 def test_fixup_substitution() -> None:
@@ -544,25 +546,32 @@ def test_map_info() -> None:
     # No warning with an empty map info.
     VMF(map_info={})
 
-    vmf = pytest.deprecated_call(VMF,  map_info={'showgrid': '0'})
+    with pytest.deprecated_call():
+        vmf = VMF(map_info={'showgrid': '0'})
     assert vmf.show_grid is False
 
-    vmf = pytest.deprecated_call(VMF,  map_info={'snaptogrid': '0'})
+    with pytest.deprecated_call():
+        vmf = VMF(map_info={'snaptogrid': '0'})
     assert vmf.snap_grid is False
 
-    vmf = pytest.deprecated_call(VMF,  map_info={'show3dgrid': '1'})
+    with pytest.deprecated_call():
+        vmf = VMF(map_info={'show3dgrid': '1'})
     assert vmf.show_3d_grid is True
 
-    vmf = pytest.deprecated_call(VMF,  map_info={'showlogicalgrid': '1'})
+    with pytest.deprecated_call():
+        vmf = VMF(map_info={'showlogicalgrid': '1'})
     assert vmf.show_logic_grid is True
 
-    vmf = pytest.deprecated_call(VMF,  map_info={'gridspacing': '1024'})
+    with pytest.deprecated_call():
+        vmf = VMF(map_info={'gridspacing': '1024'})
     assert vmf.grid_spacing == 1024
 
-    vmf = pytest.deprecated_call(VMF,  map_info={'active_cam': '84'})
+    with pytest.deprecated_call():
+        vmf = VMF(map_info={'active_cam': '84'})
     assert vmf.active_cam == 84
 
-    vmf = pytest.deprecated_call(VMF,  map_info={'quickhide': '12'})
+    with pytest.deprecated_call():
+        vmf = VMF(map_info={'quickhide': '12'})
     assert vmf.quickhide_count == 12
 
 
@@ -613,7 +622,7 @@ def test_deprecated_cordonsolid() -> None:
         assert solid.cordon_solid is None
     solid.is_cordon = True
     with pytest.deprecated_call():
-        assert solid.cordon_solid == 1
+        assert solid.cordon_solid == 1  # type: ignore[comparison-overlap]  # None check narrowed
     with pytest.deprecated_call():
         solid.cordon_solid = None
     assert solid.is_cordon is False

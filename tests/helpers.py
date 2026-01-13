@@ -1,6 +1,7 @@
 """Helpers for performing tests."""
-from typing import Callable, Generator, Iterable, Iterator, Optional, Tuple, Type, TypeVar, Union
+from typing import Optional, TypeVar, Union, Protocol
 from typing_extensions import TypeAlias
+from collections.abc import Callable, Generator, Iterable, Iterator
 import builtins
 import itertools
 import math
@@ -31,15 +32,12 @@ __all__ = [
     'Py_Matrix', 'Py_FrozenMatrix', 'Cy_Matrix', 'Cy_FrozenMatrix', 
     'Py_parse_vec_str', 'Cy_parse_vec_str',
     'VecClass', 'AngleClass', 'MatrixClass',
-    'assert_vec', 'assert_ang', 'assert_rot',
+    'assert_vec', 'assert_vec_vec', 'assert_ang', 'assert_rot',
     'frozen_thawed_vec', 'frozen_thawed_angle', 'frozen_thawed_matrix',
 ]
 
-
-VALID_NUMS = [
-    # 10e38 is the max single value, make sure we use double-precision.
-    30, 1.5, 0.2827, 2.3464545636e47,
-]
+# Make sure we use double-precision with the precise small value.
+VALID_NUMS = [30, 1.5, 0.2827, 282.34645456362782677821,]
 VALID_NUMS += [-x for x in VALID_NUMS]
 
 VALID_ZERONUMS = [*VALID_NUMS, 0, -0, 2.535047750982637e-175]
@@ -47,17 +45,17 @@ VALID_ZERONUMS = [*VALID_NUMS, 0, -0, 2.535047750982637e-175]
 # In SMD files the maximum precision is this, so it should be a good reference.
 EPSILON = 1e-6
 
-PyCVec: TypeAlias = Tuple[
-    Type[Py_Vec], Type[Py_Angle], Type[Py_Matrix],
-    Callable[..., Tuple[float, float, float]
+PyCVec: TypeAlias = tuple[
+    type[Py_Vec], type[Py_Angle], type[Py_Matrix],
+    Callable[..., tuple[float, float, float]
 ]]
 T = TypeVar('T')
-VecClass: TypeAlias = Union[Type[Py_Vec], Type[Py_FrozenVec]]
-AngleClass: TypeAlias = Union[Type[Py_Angle], Type[Py_FrozenAngle]]
-MatrixClass: TypeAlias = Union[Type[Py_Matrix], Type[Py_FrozenMatrix]]
+VecClass: TypeAlias = Union[type[Py_Vec], type[Py_FrozenVec]]
+AngleClass: TypeAlias = Union[type[Py_Angle], type[Py_FrozenAngle]]
+MatrixClass: TypeAlias = Union[type[Py_Matrix], type[Py_FrozenMatrix]]
 
 
-def iter_vec(nums: Iterable[T]) -> Iterator[Tuple[T, T, T]]:
+def iter_vec(nums: Iterable[T]) -> Iterator[tuple[T, T, T]]:
     return itertools.product(nums, nums, nums)
 
 
@@ -79,7 +77,7 @@ def assert_ang(
     msg: object = '',
     tol: float = EPSILON,
     type: Optional[type] = None,
-):
+) -> None:
     """Asserts that an Angle is equal to the provided angles."""
     # Don't show in pytest tracebacks.
     __tracebackhide__ = True
@@ -135,21 +133,40 @@ def assert_vec(
     assert builtins.type(vec).__name__ in ('Vec', 'FrozenVec'), vec
     if type is not None:
         assert builtins.type(vec) is type, f'{builtins.type(vec)} != {type}: {msg}'
-
-    if not math.isclose(vec.x, x, abs_tol=tol):
-        failed = 'x'
-    elif not math.isclose(vec.y, y, abs_tol=tol):
-        failed = 'y'
-    elif not math.isclose(vec.z, z, abs_tol=tol):
-        failed = 'z'
+    vx, vy, vz = vec.x, vec.y, vec.z
+    if not isinstance(vx, float):
+        new_msg = f'{vec!r}.x = {vx!r}'
+    elif not isinstance(vy, float):
+        new_msg = f'{vec!r}.y = {vy!r}'
+    elif not isinstance(vz, float):
+        new_msg = f'{vec!r}.z = {vz!r}'
     else:
-        # Success!
-        return
+        if not math.isclose(vec.x, x, abs_tol=tol):
+            failed = 'x'
+        elif not math.isclose(vec.y, y, abs_tol=tol):
+            failed = 'y'
+        elif not math.isclose(vec.z, z, abs_tol=tol):
+            failed = 'z'
+        else:
+            # Success!
+            return
 
-    new_msg = f"{vec!r}.{failed} != ({x}, {y}, {z})"
+        new_msg = f"{vec!r}.{failed} != ({x}, {y}, {z})"
     if msg:
         new_msg += ': ' + str(msg)
     pytest.fail(new_msg)
+
+
+def assert_vec_vec(
+    vec: vec_mod.VecBase,
+    desired: vec_mod.VecBase,
+    msg: object = '',
+    tol: float = EPSILON,
+    type: Optional[type] = None,
+) -> None:
+    """Assert one vec is equal to the expected one."""
+    __tracebackhide__ = True
+    assert_vec(vec, desired.x, desired.y, desired.z, msg, tol, type)
 
 
 def assert_rot(
@@ -189,9 +206,16 @@ if Py_Vec is Cy_Vec:
 else:
     parms = ['Python', 'Cython']
 
+CallT = TypeVar('CallT', bound=Callable[..., None])
+
+
+class Deco(Protocol):
+    def __call__(self, func: CallT, /) -> CallT:
+        ...
+
 
 @pytest.fixture(params=parms)
-def py_c_vec(request) -> Generator[None, None, None]:
+def py_c_vec(request: pytest.FixtureRequest) -> Generator[None, None, None]:
     """Run the test twice, for the Python and C versions."""
     originals = [getattr(vec_mod, name) for name in ATTRIBUTES]
     prefix = request.param[:2] + '_'  # Python -> Py_
@@ -204,7 +228,7 @@ def py_c_vec(request) -> Generator[None, None, None]:
             setattr(vec_mod, name, orig)
 
 
-def parameterize_cython(param: str, py_vers: object, cy_vers: object):
+def parameterize_cython(param: str, py_vers: object, cy_vers: object) -> Deco:
     """If the Cython version is available, parameterize the test function."""
     if py_vers is cy_vers:
         return pytest.mark.parametrize(param, [py_vers], ids=['Python'])
@@ -213,18 +237,18 @@ def parameterize_cython(param: str, py_vers: object, cy_vers: object):
 
 
 @pytest.fixture(params=['Vec', 'FrozenVec'])
-def frozen_thawed_vec(py_c_vec, request) -> VecClass:
+def frozen_thawed_vec(py_c_vec: PyCVec, request: pytest.FixtureRequest) -> VecClass:
     """Support testing both mutable and immutable vectors."""
-    return getattr(vec_mod, request.param)
+    return getattr(vec_mod, request.param)  # type: ignore[no-any-return]
 
 
 @pytest.fixture(params=['Angle', 'FrozenAngle'])
-def frozen_thawed_angle(py_c_vec, request) -> AngleClass:
+def frozen_thawed_angle(py_c_vec: PyCVec, request: pytest.FixtureRequest) -> AngleClass:
     """Support testing both mutable and immutable angles."""
-    return getattr(vec_mod, request.param)
+    return getattr(vec_mod, request.param)  # type: ignore[no-any-return]
 
 
 @pytest.fixture(params=['Matrix', 'FrozenMatrix'])
-def frozen_thawed_matrix(py_c_vec, request) -> MatrixClass:
+def frozen_thawed_matrix(py_c_vec: PyCVec, request: pytest.FixtureRequest) -> MatrixClass:
     """Support testing both mutable and immutable matrices."""
-    return getattr(vec_mod, request.param)
+    return getattr(vec_mod, request.param)  # type: ignore[no-any-return]

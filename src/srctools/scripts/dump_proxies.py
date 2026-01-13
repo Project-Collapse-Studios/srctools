@@ -1,7 +1,7 @@
 """Parse out all material proxies used in the given game."""
-from typing import Counter, DefaultDict, List
+from typing import Optional
+from collections import Counter, defaultdict
 import argparse
-import sys
 import traceback
 
 from srctools.filesys import FileSystem, RawFileSystem
@@ -9,7 +9,7 @@ from srctools.game import Game
 from srctools.vmt import Material
 
 
-def main(args: List[str]) -> None:
+def main(args: Optional[list[str]] = None) -> None:
     """Parse out all material proxies used in the given game."""
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -28,8 +28,8 @@ def main(args: List[str]) -> None:
         fsys = RawFileSystem(result.game)
 
     # Shader/proxy -> parameter -> use count
-    shader_params = DefaultDict[str, Counter[str]](Counter)
-    shader_proxies = DefaultDict[str, Counter[str]](Counter)
+    shader_params: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    shader_proxies: defaultdict[str, Counter[str]] = defaultdict(Counter)
 
     for file in fsys.walk_folder('materials/'):
         if not file.path.endswith('.vmt'):
@@ -71,4 +71,4 @@ def main(args: List[str]) -> None:
 
 
 if __name__ == '__main__':
-    main(sys.argv[1:])
+    main()

@@ -1,18 +1,18 @@
 """Parses Source models, to extract metadata."""
-from typing import (
-    Any, BinaryIO, Dict, Iterable, Iterator, List, Optional, Tuple, TypeVar, Union, cast,
-)
+from typing import Any, Optional, TypeVar, Union, cast
+from collections.abc import Iterable, Iterator
 from enum import Enum, Flag as FlagEnum
 from pathlib import PurePosixPath
 from struct import Struct
 
 import attrs
 
-from srctools.binformat import read_nullstr, read_offset_array, str_readvec, struct_read
-from srctools.const import add_unknown
-from srctools.filesys import File, FileSystem
-from srctools.keyvalues import Keyvalues
-from srctools.math import Vec
+from .binformat import read_nullstr, read_offset_array, str_readvec, struct_read
+from .const import add_unknown
+from .filesys import File, FileSystem
+from .keyvalues import Keyvalues
+from .math import Vec
+from .types import FileR, FileRSeek
 
 
 __all__ = [
@@ -20,8 +20,8 @@ __all__ = [
     'AnimEventTypes', 'CL', 'SV', 'AnimEvents',
     'IncludedMDL', 'SeqEvent', 'Sequence',
 ]
-# All the file extensions used for models, other than .mdl.
-MDL_EXTS_EXTRA: Tuple[str, ...] = (
+#: All the file extensions used for models, other than .mdl.
+MDL_EXTS_EXTRA: tuple[str, ...] = (
     '.phy',
     '.vvd',
     '.ani',
@@ -30,8 +30,8 @@ MDL_EXTS_EXTRA: Tuple[str, ...] = (
     '.sw.vtx',
     '.vtx',
 )
-# All the file extensions used for models.
-MDL_EXTS: Tuple[str, ...] = (
+#: All the file extensions used for models.
+MDL_EXTS: tuple[str, ...] = (
     '.mdl',
     *MDL_EXTS_EXTRA,
 )
@@ -283,11 +283,11 @@ class AnimEvents(Enum):
     CSGO_FOOT_WALK = 4002
 
 
-ANIM_EVENT_BY_INDEX: Dict[int, AnimEvents] = {
+ANIM_EVENT_BY_INDEX: dict[int, AnimEvents] = {
     event.value: event
     for event in AnimEvents
 }
-ANIM_EVENT_BY_NAME: Dict[str, AnimEvents] = {
+ANIM_EVENT_BY_NAME: dict[str, AnimEvents] = {
     event.name: event
     for event in AnimEvents
     # Don't save some that don't actually have official names.
@@ -320,7 +320,7 @@ class Sequence:
     act_name: str
     flags: int
     act_weight: int
-    events: List[SeqEvent]
+    events: list[SeqEvent]
     bbox_min: Vec
     bbox_max: Vec
     # More after here.
@@ -349,12 +349,12 @@ class Model:
     mass: float
     contents: Any  # TODO
     numAllowedRootLods: int
-    cdmaterials: List[str]
-    skins: List[List[str]]
+    cdmaterials: list[str]
+    skins: list[list[str]]
     surfaceprop: str
     keyvalues: str
-    included_models: List[IncludedMDL]
-    sequences: List[Sequence]
+    included_models: list[IncludedMDL]
+    sequences: list[Sequence]
 
     def __init__(self, filesystem: FileSysT, file: File[FileSysT]) -> None:
         """Parse a model from a file."""
@@ -376,7 +376,7 @@ class Model:
             with phy_file.open_bin() as f:
                 self._parse_phy(f, phy_file.path)
 
-    def _load(self, f: BinaryIO) -> None:
+    def _load(self, f: FileRSeek[bytes]) -> None:
         """Read data from the MDL file."""
         assert f.tell() == 0, "Doesn't begin at start?"
         if f.read(4) != b'IDST':
@@ -549,8 +549,8 @@ class Model:
 
         # Build texture data
         f.seek(texture_offset)
-        textures: List[Tuple[str, int, int]] = [('', 0, 0)] * texture_count
-        tex_temp: List[Tuple[int, Tuple[int, int, int]]] = [(0, (0, 0, 0))] * texture_count
+        textures: list[tuple[str, int, int]] = [('', 0, 0)] * texture_count
+        tex_temp: list[tuple[int, tuple[int, int, int]]] = [(0, (0, 0, 0))] * texture_count
         for tex_ind in range(texture_count):
             tex_temp[tex_ind] = (
                 f.tell(),
@@ -562,7 +562,7 @@ class Model:
                 # 2 4-byte pointers in studiomdl to the material class, for
                 #      server and client - shouldn't be in the file...
                 # 40 bytes of unused space (for expansion...)
-                cast('Tuple[int, int, int]', struct_read('iii 4x 8x 40x', f)),
+                cast('tuple[int, int, int]', struct_read('iii 4x 8x 40x', f)),
             )
         for tex_ind, (offset, data) in enumerate(tex_temp):
             name_offset, flags, used = data
@@ -625,9 +625,9 @@ class Model:
         self._cull_skins_table(f, bodypart_count)
 
     @staticmethod
-    def _read_sequences(f: BinaryIO, count: int) -> List[Sequence]:
+    def _read_sequences(f: FileRSeek[bytes], count: int) -> list[Sequence]:
         """Split this off to decrease stack in main parse method."""
-        sequences: List[Sequence] = [cast(Sequence, None)] * count
+        sequences: list[Sequence] = [cast(Sequence, None)] * count
         for i in range(count):
             start_pos = f.tell()
             (
@@ -652,7 +652,7 @@ class Model:
             end_pos = f.tell()
 
             f.seek(start_pos + event_pos)
-            events: List[SeqEvent] = [cast(SeqEvent, None)] * event_count
+            events: list[SeqEvent] = [cast(SeqEvent, None)] * event_count
             for j in range(event_count):
                 event_start = f.tell()
                 (
@@ -714,7 +714,7 @@ class Model:
 
         return sequences
 
-    def _cull_skins_table(self, f: BinaryIO, body_count: int) -> None:
+    def _cull_skins_table(self, f: FileRSeek[bytes], body_count: int) -> None:
         """Fix the table of used skins to correspond to those actually used.
 
         StudioMDL is rather messy, and adds many extra columns that are not used
@@ -784,7 +784,7 @@ class Model:
         for skin_ind, tex in enumerate(self.skins):
             self.skins[skin_ind] = [tex[i] for i in used_inds]
 
-    def _parse_phy(self, f: BinaryIO, filename: str) -> None:
+    def _parse_phy(self, f: FileR[bytes], filename: str) -> None:
         """Parse the physics data file, if present.
         """
         [

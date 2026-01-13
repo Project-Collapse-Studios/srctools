@@ -1,16 +1,19 @@
 """Test the datamodel exchange implementation."""
-from typing import Callable, Set, Tuple, Type, cast
+from typing import Any, cast, Optional, Literal
+from collections.abc import Callable
 from io import BytesIO
-from pathlib import Path
 from uuid import UUID, uuid4
 import array
 import collections
 
 from dirty_equals import IsFloat, IsInt
+from pytest_datadir.plugin import LazyDataDir
+from pytest_regressions.file_regression import FileRegressionFixture
 import pytest
 
 from helpers import *
-from srctools import Angle, FrozenAngle, FrozenMatrix, FrozenVec, Keyvalues, Matrix, Vec
+from srctools.math import Angle, FrozenAngle, FrozenMatrix, FrozenVec, Matrix, Vec
+from srctools.keyvalues import Keyvalues
 from srctools.dmx import (
     TYPE_CONVERT, Attribute, Color, Element, Quaternion, Time, ValueType, Vec2, Vec4,
     deduce_type,
@@ -23,7 +26,7 @@ def assert_tree(tree1: Element, tree2: Element) -> None:
     return _assert_tree_elem(tree1.name, tree1, tree2, set())
 
 
-def export(elem: Element, version: str, unicode: str = 'ascii') -> bytes:
+def export(elem: Element, version: str, unicode: Literal['ascii', 'format', 'silent'] = 'ascii') -> bytes:
     """Export a element and return the result, doing both text/binary in one for parameterisation."""
     buf = BytesIO()
     if version.startswith('binary_'):
@@ -38,7 +41,11 @@ EXPORT_VALS = [
 ]
 
 
-def _assert_tree_elem(path: str, tree1: Element, tree2: Element, checked: Set[UUID]) -> None:
+def _assert_tree_elem(
+    path: str,
+    tree1: Optional[Element], tree2: Optional[Element],
+    checked: set[UUID],
+) -> None:
     """Checks two elements are the same."""
     if tree1 is None or tree2 is None:
         # Old code stored none for NULL elements
@@ -61,11 +68,11 @@ def _assert_tree_elem(path: str, tree1: Element, tree2: Element, checked: Set[UU
         try:
             attr1 = tree1[key]
         except KeyError:
-            return pytest.fail(f'{attr_path}: {key} not in LHS')
+            pytest.fail(f'{attr_path}: {key} not in LHS')
         try:
             attr2 = tree2[key]
         except KeyError:
-            return pytest.fail(f'{attr_path}: {key} not in RHS')
+            pytest.fail(f'{attr_path}: {key} not in RHS')
 
         if attr1.type is not attr2.type:
             pytest.fail(f'{attr_path}: type {attr1.type} != {attr2.type}')
@@ -377,7 +384,7 @@ def test_attr_extend() -> None:
     assert arr[2].val_float == 3.0
 
     # Test a pure iterator
-    arr.extend(x for x in [1.3, 4.2, '8.9'])
+    arr.extend(x for x in (1.3, 4.2, '8.9'))
     assert len(arr) == 6
     assert arr[0].val_float == 1.0
     assert arr[1].val_float == 2.0
@@ -430,7 +437,10 @@ def test_attr_extend() -> None:
         '0.0 0.0 0.0 1.0',
     ),
 ])
-def test_binary_text_conversion(typ: ValueType, attr: str, value, binary: bytes, text: str) -> None:
+def test_binary_text_conversion(
+    typ: ValueType, attr: str, value: Any,
+    binary: bytes, text: str,
+) -> None:
     """Test the required binary and text conversions."""
     assert TYPE_CONVERT[typ, ValueType.BINARY](value) == binary
     assert TYPE_CONVERT[ValueType.BINARY, typ](binary) == value
@@ -488,10 +498,10 @@ def test_binary_text_conversion(typ: ValueType, attr: str, value, binary: bytes,
     'int', 'float', 'bool', 'str', 'bytes', 'time', 'color',
     'vec2', 'vec3', 'vec4', 'angle', 'quaternion', 'matrix',
 ])
-def test_attr_array_constructor(typ: ValueType, iterable: list, expected: list) -> None:
+def test_attr_array_constructor(typ: ValueType, iterable: list[Any], expected: list[Any]) -> None:
     """Test constructing an array attribute."""
     expected_type = type(expected[0])
-    attr = Attribute.array('some_array', typ, iterable)
+    attr = Attribute.array('some_array', typ, iterable)  # type: ignore  # Non-literal type.
     assert attr.is_array
     assert len(attr) == len(expected)
     for i, (actual, expect) in enumerate(zip(attr._value, expected)):
@@ -514,7 +524,7 @@ def test_attr_array_elem_constructor() -> None:
     assert attr[2].val_elem is elem1
 
 
-deduce_type_tests = [
+deduce_type_tests: list[tuple[Any, ValueType, Any]] = [
     (5, ValueType.INT, 5),
     (5.0, ValueType.FLOAT, 5.0),
     (False, ValueType.BOOL, False),
@@ -523,7 +533,7 @@ deduce_type_tests = [
     (b'test', ValueType.BIN, b'test'),
 
     (Color(25, 48, 255, 255), ValueType.COLOR, Color(25, 48, 255, 255)),
-    (Color(25.0, 48.2, 255.4, 255.9), ValueType.COLOR, Color(25, 48, 255, 255)),  # type: ignore
+    (Color(25.0, 48.2, 255.4, 255.9), ValueType.COLOR, Color(25, 48, 255, 255)),
 
     (Vec2(1, 4.0), ValueType.VEC2, Vec2(1.0, 4.0)),
     (Vec(1.8, 4.0, 8), ValueType.VEC3, FrozenVec(1.8, 4.0, 8.0)),
@@ -536,16 +546,16 @@ deduce_type_tests = [
 ]
 
 
-@pytest.mark.parametrize('input, val_type, output', deduce_type_tests)
-def test_deduce_type_basic(input, val_type, output) -> None:
+@pytest.mark.parametrize('input_val, val_type, output', deduce_type_tests)
+def test_deduce_type_basic(input_val: Any, val_type: ValueType, output: Any) -> None:
     """Test type deduction behaves correctly."""
-    [test_type, test_val] = deduce_type(input)
+    [test_type, test_val] = deduce_type(input_val)
     assert test_type is val_type
     assert type(test_val) is type(output)
     assert test_val == output
 
 
-@pytest.mark.parametrize('input, val_type, output', [
+@pytest.mark.parametrize('input_val, val_type, output', [
     # Add the above tests here too.
     ([inp, inp, inp], val_typ, [out, out, out])
     for inp, val_typ, out in
@@ -573,11 +583,12 @@ def test_deduce_type_basic(input, val_type, output) -> None:
     (collections.deque([1.0, 2.0, 3.0]), ValueType.FLOAT, [1.0, 2.0, 3.0]),
     (range(5), ValueType.INT, [0, 1, 2, 3, 4]),
 ])
-def test_deduce_type_array(input, val_type, output) -> None:
+def test_deduce_type_array(input_val: list[Any], val_type: ValueType, output: list[Any]) -> None:
     """Test array deduction, and some special cases."""
-    [test_type, test_arr] = deduce_type(input)
+    [test_type, test_arr] = deduce_type(input_val)
     assert test_type is val_type
-    assert len(input) == len(test_arr), repr(test_arr)
+    assert isinstance(test_arr, list)
+    assert len(input_val) == len(test_arr), repr(test_arr)
     for i, (test, out) in enumerate(zip(test_arr, output)):
         assert type(test) is type(out), f'{i}: {test!r} != {out!r}'
         assert test == out, f'{i}: {test!r} != {out!r}'
@@ -587,9 +598,9 @@ def test_deduce_type_adv() -> None:
     """Test specific overrides and behaviour."""
     # Print means any successful result ends up in the console.
     with pytest.raises(TypeError):  # Other types.
-        print(deduce_type(...))
+        print(deduce_type(...))  # type: ignore
     with pytest.raises(TypeError):
-        print(deduce_type([...]))
+        print(deduce_type([...]))  # type: ignore
 
     # Empty result.
     with pytest.raises(TypeError):
@@ -598,6 +609,22 @@ def test_deduce_type_adv() -> None:
         print(deduce_type(()))
     with pytest.raises(TypeError):
         print(deduce_type(range(0)))
+
+
+def test_elem_get() -> None:
+    """Test the behaviours that get various values."""
+    elem = Element('Named', 'Type')
+    elem['keyName'] = attr = Attribute.string('keyName', 'hello')
+    assert elem['keyName'] is attr
+    with pytest.raises(KeyError):
+        elem['missing']
+    assert elem.get_wrap('keyName') is attr
+    assert elem.get_wrap('keyName', 'default') is attr
+    assert elem.get_wrap('miSSing', 45) == Attribute.int('miSSing', 45)
+    assert elem.get_wrap('miSSing', True) == Attribute.bool('miSSing', True)
+    assert elem.get_wrap('miSSing', [1.0, 2.0]) == Attribute.array(
+        'miSSing', ValueType.FLOAT, [1.0, 2.0],
+    )
 
 
 def test_special_attr_name() -> None:
@@ -638,9 +665,9 @@ def test_special_attr_id() -> None:
     'binary_v4',  # L4D2's dmxconvert
     'binary_v5',  # P2+'s dmxconvert
 ])
-def test_parse(datadir: Path, filename: str) -> None:
+def test_parse(lazy_datadir: LazyDataDir, filename: str) -> None:
     """Test parsing all the format types."""
-    with (datadir / f'{filename}.dmx').open('rb') as f:
+    with (lazy_datadir / f'{filename}.dmx').open('rb') as f:
         root, fmt_name, fmt_version = Element.parse(f)
     assert fmt_name == 'dmx'
 
@@ -823,22 +850,22 @@ def verify_sample(root: Element) -> None:
     assert arr_elem[3].val is arr_elem_1
 
 
-def test_parse_binaryv3(datadir: Path) -> None:
+def test_parse_binaryv3(lazy_datadir: LazyDataDir) -> None:
     """Test parsing of binary version 3.
 
     We don't have a DMXconvert that produces this, so instead compare an existing
     file to the text version.
     """
-    with (datadir / 'tf_movies.dmx').open('rb') as f:
+    with (lazy_datadir / 'tf_movies.dmx').open('rb') as f:
         root_bin, fmt_name, fmt_version = Element.parse(f)
-    with (datadir / 'tf_movies_text.dmx').open('rb') as f:
+    with (lazy_datadir / 'tf_movies_text.dmx').open('rb') as f:
         root_txt, fmt_name, fmt_version = Element.parse(f)
     assert_tree(root_bin, root_txt)
 
 
-def test_parse_long_header(datadir: Path) -> None:
+def test_parse_long_header(lazy_datadir: LazyDataDir) -> None:
     """Test parsing a DMX with a long header, requiring additional reads to complete."""
-    with (datadir / 'kv2_long_header.dmx').open('rb') as f:
+    with (lazy_datadir / 'kv2_long_header.dmx').open('rb') as f:
         root, fmt_name, fmt_version = Element.parse(f)
     assert len(fmt_name) == 205
     assert fmt_version == 123456789
@@ -848,9 +875,9 @@ def test_parse_long_header(datadir: Path) -> None:
 
 
 @pytest.mark.parametrize('version', [2, 4, 5])
-def test_export_bin_roundtrip(datadir: Path, version: int) -> None:
+def test_export_bin_roundtrip(lazy_datadir: LazyDataDir, version: int) -> None:
     """Test exporting binary types roundtrip."""
-    with (datadir / 'binary_v5.dmx').open('rb') as f:
+    with (lazy_datadir / 'binary_v5.dmx').open('rb') as f:
         root, fmt_name, fmt_version = Element.parse(f)
 
     buf = BytesIO()
@@ -865,9 +892,9 @@ def test_export_bin_roundtrip(datadir: Path, version: int) -> None:
 
 
 @pytest.mark.parametrize('flat', [False, True], ids=['indented', 'flat'])
-def test_export_kv2_roundtrip(datadir: Path, flat: bool) -> None:
+def test_export_kv2_roundtrip(lazy_datadir: LazyDataDir, flat: bool) -> None:
     """Test exporting keyvalues2 roundtrip."""
-    with (datadir / 'keyvalues2.dmx').open('rb') as f:
+    with (lazy_datadir / 'keyvalues2.dmx').open('rb') as f:
         root, fmt_name, fmt_version = Element.parse(f)
 
     buf = BytesIO()
@@ -900,7 +927,7 @@ def test_ext_roundtrip_unicode(version: str) -> None:
     explicit = export(root, version, 'format')
 
     # No flags, fails. UnicodeError from binary, TokenSyntaxError from text.
-    exc: Tuple[Type[Exception], ...] = (UnicodeError, TokenSyntaxError)
+    exc: tuple[type[Exception], ...] = (UnicodeError, TokenSyntaxError)
     with pytest.raises(exc):
         Element.parse(BytesIO(silent))
 
@@ -923,9 +950,12 @@ def test_ext_roundtrip_unicode(version: str) -> None:
 
 
 @pytest.mark.parametrize('version', EXPORT_VALS)
-def test_export_regression(version: str, datadir: Path, file_regression) -> None:
+def test_export_regression(
+    version: str,
+    lazy_datadir: LazyDataDir, file_regression: FileRegressionFixture,
+) -> None:
     """Test regressions in the export results."""
-    with (datadir / 'binary_v5.dmx').open('rb') as f:
+    with (lazy_datadir / 'binary_v5.dmx').open('rb') as f:
         root, fmt_name, fmt_version = Element.parse(f)
     file_regression.check(export(root, version), extension='.dmx', binary=True)
 

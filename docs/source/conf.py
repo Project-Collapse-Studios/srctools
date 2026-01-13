@@ -4,6 +4,7 @@ import sys
 import os
 
 from sphinx.application import Sphinx
+import attrs
 
 
 # Prevent Cython modules from importing, Python ones have all the type hints and docstrings.
@@ -14,16 +15,18 @@ sys.modules['srctools._cy_vtf_readwrite'] = None
 # -- Project information -----------------------------------------------------
 
 project = 'srctools'
-copyright = '2024, TeamSpen210'
+copyright = '2025, TeamSpen210'
 author = 'TeamSpen210'
+
+needs_sphinx = '8.2'
 
 # The full version, including alpha/beta/rc tags
 # Use RTD version if available, otherwise check project.
 try:
     release = os.environ['READTHEDOCS_VERSION_NAME']
 except KeyError:
-    import srctools
-    release = srctools.__version__
+    import importlib.metadata
+    release = importlib.metadata.version('srctools')
 
 
 # -- General configuration ---------------------------------------------------
@@ -34,17 +37,28 @@ except KeyError:
 extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.intersphinx',
+    'sphinx.ext.extlinks',
+    'sphinxcontrib_trio',
 ]
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
+
+# `names` should lookup Python objects.
+default_role = "py:obj"
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
 exclude_patterns = []
 
-maximum_signature_line_length = 56
+python_trailing_comma_in_multi_line_signatures = True
+maximum_signature_line_length = 90
+
+rst_prolog = '''
+.. role:: pycode(code)
+   :language: python
+'''
 
 # -- Intersphinx ------
 
@@ -52,10 +66,32 @@ intersphinx_mapping = {
     'python': ('https://docs.python.org/3', None),
 }
 
+# -- Extensions ----------
 
 # Fully-qualified is way too verbose.
 autodoc_typehints_format = 'short'
 autodoc_member_order = 'bysource'
+
+autodoc_type_aliases = {
+    "ValidKVs": "ValidKVs",
+}
+
+
+extlinks = {
+    'gh-user': ('https://github.com/%s', '@%s'),
+    'src-issue': ('https://github.com/TeamSpen210/srctools/issues/%s', 'Issue #%s'),
+    'src-pull': ('https://github.com/TeamSpen210/srctools/pulls/%s', 'PR #%s'),
+    'ha-issue': ('https://github.com/TeamSpen210/HammerAddons/issues/%s', 'HammerAddons Issue #%s'),
+    'bee-app-issue': ('https://github.com/BEEmod/BEE2.4/issues/%s', 'BEE Issue #%s'),
+    'bee-pack-issue': ('https://github.com/BEEmod/BEE2-items/issues/%s', 'BEE Issue #%s'),
+    'vdc': ('https://developer.valvesoftware.com/wiki/%s', '%s'),
+    # Pre-TF2 SDK commit.
+    'sdk-2013': ('https://github.com/ValveSoftware/source-sdk-2013/blob/0d8dceea4310fde5706b3ce1c70609d72a38efdf/sp/src/%s', "%s"),
+    'sdk-2013-mp': ('https://github.com/ValveSoftware/source-sdk-2013/blob/0d8dceea4310fde5706b3ce1c70609d72a38efdf/mp/src/%s', "%s"),
+    # Current TF2 SDK commit.
+    'sdk-2025': ('https://github.com/ValveSoftware/source-sdk-2013/blob/2d3a6efb50bba856a44e73d4f0098ed4a726699c/src/%s', "%s"),
+}
+extlinks_detect_hardcoded_links = True
 
 
 # -- Options for HTML output -------------------------------------------------
@@ -79,8 +115,46 @@ from enum_class import EnumDocumenter, EnumMemberDocumenter
 from missing_refs import on_missing_reference
 
 
+# https://www.sphinx-doc.org/en/master/usage/extensions/autodoc.html#event-autodoc-process-signature
+def autodoc_process_signature(
+    app: Sphinx,
+    what: str,
+    name: str,
+    obj: object,
+    options: object,
+    signature: str,
+    return_annotation: str,
+) -> tuple[str, str]:
+    """Modify found signatures to fix various issues."""
+    if signature is not None:
+        signature = signature.replace("TypeAliasForwardRef('ValidKVs')", "ValidKVs")
+        if 'srctools.binformat.find_or' in name:
+            signature = signature.replace('<built-in function id>', 'id')
+        if isinstance(obj, type) and attrs.has(obj) and 'NOTHING' in signature:
+            # attrs.NOTHING appears in the __init__ defaults, replace to be less confusing.
+            signature = signature.replace('= NOTHING', '=...')
+        signature = signature.replace('StringPath', 'str | os.PathLike[str]')
+        if 'EmptyMapping' not in name:
+            # Make `= EmptyMapping` look like `= ...`, except for inside EmptyMapping's own docs.
+            # That way users don't need to know about the singleton when reading other modules.
+            signature = signature.replace('srctools.EmptyMapping', '...')
+        if name in {'srctools.tokenizer.Tokenizer', 'srctools.tokenizer.IterTokenizer'}:
+            # These constructors default to TokenSyntaxError, but the <> in the class repr breaks
+            # the sig. Remove that.
+            signature = signature.replace(
+                "<class 'srctools.tokenizer.TokenSyntaxError'>",
+                'TokenSyntaxError',
+            )
+        if name == 'srctools.fgd.EntityDef.get_resources':
+            # Similar issue with this function as a default.
+            signature = signature.replace('<function ignore_errors>', 'ignore_errors')
+
+    return signature, return_annotation
+
+
 def setup(app: Sphinx) -> None:
     """Perform modifications."""
     app.add_autodocumenter(EnumDocumenter)
     app.add_autodocumenter(EnumMemberDocumenter)
+    app.connect("autodoc-process-signature", autodoc_process_signature)
     app.connect('missing-reference', on_missing_reference, -10)

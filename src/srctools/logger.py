@@ -3,10 +3,8 @@ Wrapper around logging to provide our own functionality.
 
 This adds the ability to log using str.format() instead of %.
 """
-from typing import (
-    TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generator, Iterable, List, Mapping,
-    Optional, TextIO, Tuple, Type, Union, cast, overload,
-)
+from typing import Literal, TYPE_CHECKING, Any, ClassVar, Optional, TextIO, Union, cast, overload
+from collections.abc import Callable, Generator, Iterable, Mapping
 from io import StringIO
 from pathlib import Path
 from types import TracebackType
@@ -22,7 +20,7 @@ from srctools import StringPath
 
 __all__ = ['LoggerAdapter', 'get_handler', 'get_logger', 'init_logging', 'context']
 # Only generic in stubs!
-CTX_STACK: 'contextvars.ContextVar[List[str]]' = contextvars.ContextVar('srctools_logger')
+CTX_STACK: 'contextvars.ContextVar[list[str]]' = contextvars.ContextVar('srctools_logger')
 
 
 class LogMessage:
@@ -31,15 +29,15 @@ class LogMessage:
     The __str__() method performs the joining.
     """
     fmt: str
-    args: Tuple[object, ...]
-    kwargs: Dict[str, object]
+    args: tuple[object, ...]
+    kwargs: dict[str, object]
     has_args: bool
 
     def __init__(
         self,
         fmt: str,
-        args: Tuple[object, ...],
-        kwargs: Dict[str, object],
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
     ) -> None:
         self.fmt = fmt
         self.args = args
@@ -82,8 +80,8 @@ class LogMessage:
 
 
 _SysExcInfoType = Union[
-    Tuple[Type[BaseException], BaseException, Optional[TracebackType]],
-    Tuple[None, None, None]
+    tuple[type[BaseException], BaseException, Optional[TracebackType]],
+    tuple[None, None, None]
 ]
 if TYPE_CHECKING:  # Only generic in stubs.
     _AdapterBase = logging.LoggerAdapter[logging.Logger]
@@ -95,10 +93,9 @@ class LoggerAdapter(_AdapterBase):
     """Fix loggers to use str.format().
 
     """
-    logger: logging.Logger
-    alias: Optional[str]
+    logger: logging.Logger  #: The logger this wraps.
+    alias: Optional[str]  #: If set, this is a replacement module name for log messages.
     def __init__(self, logger: logging.Logger, alias: Optional[str] = None) -> None:
-        # Alias is a replacement module name for log messages.
         self.alias = alias
         self.logger = logger
         logging.LoggerAdapter.__init__(self, logger, extra={})
@@ -152,12 +149,18 @@ class LoggerAdapter(_AdapterBase):
 
 class Formatter(logging.Formatter):
     """Override exception handling."""
-    SKIP_LIBS: ClassVar[List[str]] = ['importlib', 'cx_freeze', 'PyInstaller']
+    SKIP_LIBS: ClassVar[list[str]] = ['importlib', 'cx_freeze', 'PyInstaller']
+    def __init__(
+        self,
+        template: str,
+        *,
+        expand_exc_groups: bool=False,
+        style: Literal['{']='{',  # Here only for backwards compat.
+    ) -> None:
+        super().__init__(template, style=style)
+        self.expand_exc_groups = expand_exc_groups
 
-    def formatException(self, ei: Union[
-        Tuple[Type[BaseException], BaseException, Optional[TracebackType]],
-        Tuple[None, None, None],
-    ]) -> str:
+    def formatException(self, ei: _SysExcInfoType) -> str:
         """Ignore importlib, cx_freeze and PyInstaller."""
         exc_type, exc_value, exc_tb = ei
         buffer = StringIO()
@@ -179,7 +182,17 @@ class Formatter(logging.Formatter):
             trace = exc_tb
 
         if exc_type is not None and exc_value is not None:
-            for line in traceback.TracebackException(exc_type, exc_value, trace).format():
+            # Include much more of exception groups in the log files.
+            # Mypy needs version check first.
+            if sys.version_info >= (3, 11) and self.expand_exc_groups:
+                tb_exc = traceback.TracebackException(
+                    exc_type, exc_value, trace,
+                    max_group_depth=64,
+                    max_group_width=100,
+                )
+            else:
+                tb_exc = traceback.TracebackException(exc_type, exc_value, trace)
+            for line in tb_exc.format():
                 buffer.write(line)
 
         return buffer.getvalue().rstrip('\n')
@@ -190,7 +203,7 @@ class Formatter(logging.Formatter):
         return super().format(record)
 
 
-def get_handler(filename: 'str | os.PathLike[str]') -> logging.FileHandler:
+def get_handler(filename: Union[str, os.PathLike[str]]) -> logging.FileHandler:
     """Cycle log files, then give the required file handler."""
     path = Path(filename)
     ext = ''.join(path.suffixes)
@@ -237,7 +250,7 @@ class NullStream(TextIO):
 
     def __exit__(
         self,
-        typ: Optional[Type[BaseException]],
+        typ: Optional[type[BaseException]],
         value: Optional[BaseException],
         tback: Optional[TracebackType],
     ) -> None:
@@ -283,7 +296,7 @@ class NullStream(TextIO):
         """We never have data."""
         return ''
 
-    def readlines(self, hint: int = -1) -> List[str]:
+    def readlines(self, hint: int = -1) -> list[str]:
         """We never have data."""
         return []
 
@@ -331,7 +344,7 @@ def init_logging(
     filename: Optional[StringPath] = None,
     main_logger: str = '',
     on_error: Optional[Callable[
-        [Type[BaseException], BaseException, Optional[TracebackType]],
+        [type[BaseException], BaseException, Optional[TracebackType]],
         None,
     ]] = None,
 ) -> logging.Logger: ...
@@ -350,7 +363,7 @@ def init_logging(
     filename: Optional[StringPath] = None,
     main_logger: str = '',
     on_error: Optional[Callable[
-        [Type[BaseException], BaseException, Optional[TracebackType]],
+        [type[BaseException], BaseException, Optional[TracebackType]],
         None,
     ]] = None,
     *,
@@ -382,21 +395,20 @@ def init_logging(
 
         def error_closure(exc: BaseException) -> None:
             """Call the old error handler function."""
-            if on_error is not None:  # Mypy can't infer this is constant.
-                on_error(type(exc), exc, exc.__traceback__)
+            on_error(type(exc), exc, exc.__traceback__)
 
         error = error_closure
 
     # Put more info in the log file, since it's not onscreen.
     long_log_format = Formatter(
         '[{levelname}]{srctools_context} {module}.{funcName}(): {message}',
-        style='{',
+        expand_exc_groups=True,
     )
     # Console messages, etc.
     short_log_format = Formatter(
         # One letter for level name
         '[{levelname[0]}]{srctools_context} {module}.{funcName}(): {message}',
-        style='{',
+        expand_exc_groups=False,
     )
 
     if filename is not None:
@@ -443,7 +455,7 @@ def init_logging(
     old_except_handler = sys.excepthook
 
     def except_handler(
-        exc_type: Type[BaseException],
+        exc_type: type[BaseException],
         exc_value: BaseException,
         exc_tb: Optional[TracebackType],
     ) -> None:

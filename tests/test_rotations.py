@@ -1,16 +1,18 @@
 """Test rotations in srctools.math."""
-from typing import List, NamedTuple, Tuple
+from typing import NamedTuple
 from pathlib import Path
 import math
 
 import pytest
 
 from helpers import *
+from srctools import math as vec_mod
+from srctools.math import AnyAngle, VecUnion
 
 
 class RotationData(NamedTuple):
     """Result of the rotation_data fixture."""
-    angle: Tuple[float, float, float]
+    angle: tuple[float, float, float]
 
     for_x: float
     for_y: float
@@ -27,7 +29,7 @@ class RotationData(NamedTuple):
 
 # TODO: pytest-datadir doesn't have session-scope fixture.
 @pytest.fixture(scope='session')
-def rotation_data() -> List[RotationData]:
+def rotation_data() -> list[RotationData]:
     """Parse the rotation data dumped from the engine, used to check our math."""
     data = []
     with (Path(__file__).with_suffix('') / 'rotation.txt').open() as f:
@@ -239,20 +241,23 @@ def test_single_axis(
     """In each axis, two rotations should be the same as adding."""
     Angle = frozen_thawed_angle
 
-    # Pitch gives gimbal lock and breaks recovery of the values.
-    for axis in ('yaw', 'roll'):
-        for ang1 in range(0, 360, 45):
-            for ang2 in range(0, 360, 45):
-                if ang1 + ang2 == 0:
-                    # 0 gives a value around the 360-0 split,
-                    # so it can round to the wrong side sometimes.
-                    continue
-                assert_ang(
-                    Angle(**{axis: ang1}) @
-                    Angle(**{axis: ang2}),
-                    **{axis: (ang1 + ang2) % 360},
-                    msg=(axis, ang1, ang2)
-                )
+    for ang1 in range(0, 360, 45):
+        for ang2 in range(0, 360, 45):
+            if ang1 + ang2 == 0:
+                # 0 gives a value around the 360-0 split,
+                # so it can round to the wrong side sometimes.
+                continue
+            # Pitch gives gimbal lock and breaks recovery of the values.
+            assert_ang(
+                Angle(yaw=ang1) @ Angle(yaw=ang2),
+                yaw=(res := (ang1 + ang2) % 360),
+                msg=('yaw', ang1, ang2)
+            )
+            assert_ang(
+                Angle(roll=ang1) @ Angle(roll=ang2),
+                roll=res,
+                msg=('roll', ang1, ang2)
+            )
 
 
 def test_axis_angle(
@@ -266,7 +271,7 @@ def test_axis_angle(
     Matrix = frozen_thawed_matrix
     Angle = frozen_thawed_angle
 
-    def test(axis, equiv_ang):
+    def test(axis: VecUnion, equiv_ang: AnyAngle) -> None:
         for ang in range(0, 360, 15):
             assert_rot(Matrix.axis_angle(axis, ang), Matrix.from_angle(ang * equiv_ang), f'{axis} * {ang} != {equiv_ang}')
             # Inverse axis = reversed rotation.
@@ -285,7 +290,7 @@ def test_matrix_hash(py_c_vec: PyCVec) -> None:
 
 
 def old_mat_mul(
-    self,
+    self: vec_mod.Vec,
     a: float, b: float, c: float,
     d: float, e: float, f: float,
     g: float, h: float, i: float,
@@ -302,7 +307,7 @@ def old_mat_mul(
 
 
 def old_rotate(
-    self,
+    self: vec_mod.Vec,
     pitch: float = 0.0,
     yaw: float = 0.0,
     roll: float = 0.0
@@ -380,7 +385,7 @@ def test_old_rotation(
 @pytest.mark.slow
 def test_rotating_vectors(
     py_c_vec: PyCVec,
-    rotation_data: List[RotationData],
+    rotation_data: list[RotationData],
     frozen_thawed_vec: VecClass,
     frozen_thawed_angle: AngleClass,
     frozen_thawed_matrix: MatrixClass,
@@ -447,6 +452,10 @@ def test_inplace_rotation(py_c_vec: PyCVec) -> None:
     v @= ang
     assert v == vec @ ang
 
+    v = vec.copy()
+    v @= mat
+    assert v == vec @ mat
+
     a = ang.copy()
     a @= ang2
     assert a == ang @ ang2
@@ -462,7 +471,7 @@ def test_inplace_rotation(py_c_vec: PyCVec) -> None:
 
 def test_matrix_getters(
     py_c_vec: PyCVec,
-    rotation_data: List[RotationData],
+    rotation_data: list[RotationData],
     frozen_thawed_matrix: MatrixClass,
 ) -> None:
     """Test functions which return the basis vectors for the matrix."""
@@ -478,7 +487,7 @@ def test_matrix_getters(
 @pytest.mark.parametrize('mag', [-5.0, 1.0, -1.0, 0.0, 12.45, -28.37])
 def test_matrix_getters_with_mag(
     py_c_vec: PyCVec,
-    rotation_data: List[RotationData],
+    rotation_data: list[RotationData],
     frozen_thawed_matrix: MatrixClass,
     mag: float,
 ) -> None:
@@ -494,7 +503,7 @@ def test_matrix_getters_with_mag(
 
 def test_rotating_vec_tuples(
     py_c_vec: PyCVec,
-    rotation_data: List[RotationData],
+    rotation_data: list[RotationData],
     frozen_thawed_matrix: MatrixClass,
     frozen_thawed_angle: AngleClass,
 ) -> None:
@@ -518,7 +527,7 @@ def test_rotating_vec_tuples(
 @pytest.mark.slow
 def test_rotated_matrix_data(
     py_c_vec: PyCVec,
-    rotation_data: List[RotationData],
+    rotation_data: list[RotationData],
     frozen_thawed_matrix: MatrixClass,
 ) -> None:
     """Test our rotation code with engine rotation data."""
@@ -545,7 +554,7 @@ def test_rotated_matrix_data(
 @pytest.mark.slow
 def test_from_basis_w_engine_data(
     py_c_vec: PyCVec,
-    rotation_data: List[RotationData],
+    rotation_data: list[RotationData],
     frozen_thawed_vec: VecClass,
     frozen_thawed_angle: AngleClass,
     frozen_thawed_matrix: MatrixClass,
@@ -576,7 +585,7 @@ def test_from_basis_w_engine_data(
 
 def test_vec_cross_w_engine_data(
     py_c_vec: PyCVec,
-    rotation_data: List[RotationData],
+    rotation_data: list[RotationData],
     frozen_thawed_vec: VecClass,
 ) -> None:
     """Test Vec.cross() with engine rotation data."""

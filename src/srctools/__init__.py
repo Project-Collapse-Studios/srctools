@@ -1,33 +1,21 @@
-from typing import (
-    TYPE_CHECKING, AbstractSet, Any, Container, Final, Generic, ItemsView, Iterable,
-    Iterator, KeysView, List, Mapping, MutableMapping, NoReturn, Optional, Sequence, Set,
-    Tuple, Type, TypeVar, Union, ValuesView, overload,
-)
+from typing import TYPE_CHECKING, Any, Final, Generic, NoReturn, Optional, TypeVar, Union, overload
 from typing_extensions import Literal, TypeAlias
 from collections import deque
+from collections.abc import (
+    Container, ItemsView, Iterable, Iterator, KeysView, Mapping, MutableMapping, Sequence,
+    Set as AbstractSet, ValuesView,
+)
 from pathlib import Path
 from types import TracebackType
 import io
 import itertools as _itertools
 import os as _os
-import sys as _sys
 import warnings
 
 from useful_types import SupportsKeysAndGetItem
 
 
-__version__: str
-if not TYPE_CHECKING:
-    try:
-        from ._version import __version__
-    except ImportError:
-        __version__ = '<unknown>'
-    else:
-        # Discard the now-useless module. Use globals so static analysis ignores this.
-        del _sys.modules[globals().pop('_version').__name__]
-
 __all__ = [
-    '__version__',
     'Vec', 'FrozenVec', 'parse_vec_str', 'lerp',
     'Angle', 'FrozenAngle', 'Matrix', 'FrozenMatrix',
 
@@ -40,17 +28,12 @@ __all__ = [
 
     'FileSystem', 'FileSystemChain', 'get_filesystem',
 
-    'EmptyMapping', 'StringPath',
+    'AtomicWriter', 'EmptyMapping', 'StringPath',
 
     'FGD', 'VPK',
     'VTF',
     'SurfaceProp', 'SurfChar',
     'GameID',
-
-    # Submodules:
-    'binformat', 'bsp', 'cmdseq', 'const', 'dmx', 'fgd', 'filesys', 'game',  # pyright: ignore
-    'instancing', 'logger', 'math', 'mdl', 'packlist', 'particles', 'keyvalues', 'run',  # pyright: ignore
-    'smd', 'sndscript', 'surfaceprop', 'tokenizer', 'vmf', 'vmt', 'vpk', 'vtf',  # pyright: ignore
 ]
 
 # import string
@@ -62,8 +45,7 @@ _FILE_CHARS = frozenset(
     '-_ .|'
 )
 ValT = TypeVar('ValT')
-# Pathlike can only be subscripted in 3.9+
-StringPath: TypeAlias = Union[str, '_os.PathLike[str]']
+StringPath: TypeAlias = Union[str, _os.PathLike[str]]
 
 
 def clean_line(line: str) -> str:
@@ -114,11 +96,11 @@ def blacklist(
     return ''.join(chars)
 
 
-def escape_quote_split(line: str) -> List[str]:
+def escape_quote_split(line: str) -> list[str]:
     """Split quote values on a line, handling \\" correctly."""
-    out_strings = []
+    out_strings: list[str] = []
     was_backslash = False  # Last character was a backslash
-    cur_part = []  # The current chunk of text
+    cur_part: list[str] = []  # The current chunk of text
 
     for char in line:
         if char == '\\':
@@ -211,6 +193,7 @@ def conv_bool(val: Union[str, bool, None], default: Union[ValT, bool] = False) -
         except KeyError:
             return default
 
+
 @overload
 def conv_float(val: Union[int, float, str]) -> float: ...
 @overload
@@ -250,84 +233,84 @@ class _EmptyMapping(MutableMapping[Any, Any]):
     """
     __slots__ = ()
 
-    def __call__(self) -> '_EmptyMapping':
+    def __call__(self, /) -> '_EmptyMapping':
         # Just in case someone tries to instantiate this
         return self
 
-    def __repr__(self) -> str:
+    def __repr__(self, /) -> str:
         return "srctools.EmptyMapping"
 
-    def __reduce__(self) -> str:
+    def __reduce__(self, /) -> str:
         return 'EmptyMapping'
 
-    def __getitem__(self, key: Any) -> Any:
+    def __getitem__(self, key: Any, /) -> Any:
         """All key acesses fail."""
         raise KeyError(key)
 
-    def __setitem__(self, key: Any, value: Any) -> None:
+    def __setitem__(self, key: Any, value: Any, /) -> None:
         """All key setting suceeds."""
         pass
 
-    def __delitem__(self, key: Any) -> None:
+    def __delitem__(self, key: Any, /) -> None:
         """All key deletions fail."""
         raise KeyError(key)
 
-    def __contains__(self, key: Any) -> bool:
+    def __contains__(self, key: Any, /) -> bool:
         """EmptyMapping does not have any keys."""
         return False
 
     @overload
-    def get(self, key: Any) -> None: ...
-    @overload
-    def get(self, key: Any, default: ValT) -> ValT: ...
-    def get(self, key: Any, default: Optional[ValT] = None) -> Optional[ValT]:
+    def get(self, key: Any, /) -> None: ...
+    @overload  # Stricter than Mapping.get() - that allows default=ValueT=Any, but we always return the default.
+    def get(self, key: Any, /, default: ValT) -> ValT: ...
+    def get(self, key: Any, /, default: Optional[ValT] = None) -> Optional[ValT]:  # pyright: ignore[reportIncompatibleMethodOverride]
         """get() always returns the default item."""
         return default
 
-    def __bool__(self) -> bool:
+    def __bool__(self, /) -> bool:
         """EmptyMapping is falsey."""
         return False
 
-    def __len__(self) -> int:
+    def __len__(self, /) -> int:
         """EmptyMapping is 0 long."""
         return 0
 
-    def __iter__(self) -> Iterator[Any]:
+    def __iter__(self, /) -> Iterator[Any]:
         """Iteration yields no values."""
         return iter(())
 
-    def keys(self) -> KeysView[Any]:
+    def keys(self, /) -> KeysView[Any]:
         """Return an empty keys() view singleton."""
         return EmptyKeysView
 
-    def items(self) -> ItemsView[Any, Any]:
+    def items(self, /) -> ItemsView[Any, Any]:
         """Return an empty items() view singleton."""
         return EmptyItemsView
 
-    def values(self) -> ValuesView[Any]:
+    def values(self, /) -> ValuesView[Any]:
         """Return an empty values() view singleton."""
         return EmptyValuesView
 
     # Mutable functions
 
     @overload  # type: ignore[override]
-    def setdefault(self, key: Any) -> None: ...
+    def setdefault(self, key: Any, /) -> None: ...
     # This is stricter than Mapping[Any, Any]. That returns Any, we always return the default.
     @overload
-    def setdefault(self, key: Any, default: ValT) -> ValT: ...
+    def setdefault(self, key: Any, /, default: ValT) -> ValT: ...
 
-    def setdefault(self, key: Any, default: Optional[ValT] = None) -> Optional[ValT]:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def setdefault(self, key: Any, /, default: Optional[ValT] = None) -> Optional[ValT]:  # pyright: ignore[reportIncompatibleMethodOverride]
         """setdefault() always returns the default item, but does not store it."""
         return default
 
     @overload
     def update(self, m: SupportsKeysAndGetItem[Any, Any], /, **kwargs: Any) -> None: ...
     @overload
-    def update(self, m: Iterable[Tuple[Any, Any]], /, **kwargs: Any) -> None: ...
+    def update(self, m: Iterable[tuple[Any, Any]], /, **kwargs: Any) -> None: ...
     @overload
-    def update(self, **kwargs: Any) -> None: ...
+    def update(self, /, **kwargs: Any) -> None: ...
 
-    def update(self, *args: Any, **kargs: Any) -> None:  # type: ignore  # Mypy bug?
+    def update(self, /, *args: Any, **kargs: Any) -> None:
         """Runs {}.update() on arguments."""
         # Check arguments are correct, and raise appropriately.
         # Also consume args[0] if an iterator - this raises if args > 1.
@@ -335,18 +318,19 @@ class _EmptyMapping(MutableMapping[Any, Any]):
 
     # Also stricter than Mapping[Any, Any], since we NoReturn if not passed a default.
     __marker: Final[Any] = object()
+
     @overload
     def pop(self, key: Any, /) -> NoReturn: ...
     @overload
     def pop(self, key: Any, /, default: ValT) -> ValT: ...
 
-    def pop(self, key: Any, default: ValT = __marker) -> ValT:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def pop(self, key: Any, /, default: ValT = __marker) -> ValT:  # pyright: ignore[reportIncompatibleMethodOverride]
         """Returns the default value, or raises KeyError if not present."""
         if default is self.__marker:
             raise KeyError(key)
         return default
 
-    def popitem(self) -> NoReturn:
+    def popitem(self, /) -> NoReturn:
         """Popitem() raises, since no items are in EmptyMapping."""
         raise KeyError('EmptyMapping is empty')
 
@@ -355,7 +339,7 @@ class _EmptySetView(AbstractSet[Any]):
     """Common code between EmptyKeysView and EmptyItemsView."""
     __slots__ = ()
 
-    def __len__(self) -> int:
+    def __len__(self, /) -> int:
         """This contains no keys/items."""
         return 0
 
@@ -363,7 +347,7 @@ class _EmptySetView(AbstractSet[Any]):
         """All keys/items are not present."""
         return False
 
-    def __iter__(self) -> Iterator[Any]:
+    def __iter__(self, /) -> Iterator[Any]:
         """Iteration produces no values."""
         return iter(())
 
@@ -393,13 +377,13 @@ class _EmptySetView(AbstractSet[Any]):
             return False
         return NotImplemented
 
-    def __or__(self, other: Iterable[ValT]) -> Set[ValT]:
+    def __or__(self, other: Iterable[ValT]) -> set[ValT]:
         """A binary operation which returns all the other values."""
         if not isinstance(other, Iterable):
             return NotImplemented
         return set(other)
 
-    def __and__(self, other: Iterable[ValT]) -> Set[ValT]:
+    def __and__(self, other: Iterable[ValT]) -> set[ValT]:
         """A binary operation producing no values."""
         if not isinstance(other, Iterable):
             return NotImplemented
@@ -420,10 +404,10 @@ class _EmptyKeysView(_EmptySetView, KeysView[Any]):
     """A Mapping view implementation that always acts empty, and supports set operations."""
     __slots__ = ()
 
-    def __repr__(self) -> str:
+    def __repr__(self, /) -> str:
         return 'srctools.EmptyKeysView'
 
-    def __reduce__(self) -> str:
+    def __reduce__(self, /) -> str:
         return 'EmptyKeysView'
 
 
@@ -431,10 +415,10 @@ class _EmptyItemsView(_EmptySetView, ItemsView[Any, Any]):
     """A Mapping view implementation that always acts empty, and supports set operations."""
     __slots__ = ()
 
-    def __repr__(self) -> str:
+    def __repr__(self, /) -> str:
         return 'srctools.EmptyItemsView'
 
-    def __reduce__(self) -> str:
+    def __reduce__(self, /) -> str:
         return 'EmptyItemsView'
 
 
@@ -442,21 +426,21 @@ class _EmptyValuesView(ValuesView[Any]):
     """A Mapping.values() implementation that always acts empty. This is not a set."""
     __slots__ = ()
 
-    def __repr__(self) -> str:
+    def __repr__(self, /) -> str:
         return 'srctools.EmptyValuesView'
 
-    def __reduce__(self) -> str:
+    def __reduce__(self, /) -> str:
         return 'EmptyValuesView'
 
     def __contains__(self, key: Any) -> bool:
         """All values are not present."""
         return False
 
-    def __len__(self) -> int:
+    def __len__(self, /) -> int:
         """This contains no values."""
         return 0
 
-    def __iter__(self) -> Iterator[Any]:
+    def __iter__(self, /) -> Iterator[Any]:
         """Iteration produces no values."""
         return iter(())
 
@@ -541,7 +525,7 @@ class AtomicWriter(Generic[IOKindT]):
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
+        exc_type: Optional[type[BaseException]],
         exc_value: Optional[BaseException],
         tback: Optional[TracebackType],
     ) -> None:
@@ -565,10 +549,11 @@ class AtomicWriter(Generic[IOKindT]):
         return None  # Don't cancel the exception.
 
 
-# Import these, so people can reference 'srctools.Vec' instead of 'srctools.math.Vec'.
-# Should be done after other code, so everything's initialised.
+# We offer various lazy imports, so people can reference 'srctools.Vec' instead of 'srctools.math.Vec'.
 # Not all classes are imported, just most-used ones.
 # This shouldn't be used in our modules, to ensure the order here doesn't matter.
+# Math & keyvalues are undconditionally imported since they're always used, but the others are
+# done via __getattr__.
 # isort: off
 from .math import (
     FrozenVec, Vec,
@@ -576,16 +561,7 @@ from .math import (
     FrozenMatrix, Matrix,
     FrozenAngle, Angle,
 )
-# Deprecated.
-from .math import Vec_tuple  # noqa
 from srctools.keyvalues import NoKeyError, KeyValError, Keyvalues
-from srctools.filesys import FileSystem, FileSystemChain, get_filesystem
-from srctools.vmf import VMF, Entity, Solid, Side, Output, UVAxis
-from srctools.vpk import VPK
-from srctools.fgd import FGD
-from srctools.const import GameID
-from srctools.surfaceprop import SurfaceProp, SurfChar
-from srctools.vtf import VTF
 
 _py_conv_int = _cy_conv_int = conv_int
 _py_conv_float = _cy_conv_float = conv_float
@@ -593,9 +569,26 @@ _py_conv_bool = _cy_conv_bool = conv_bool
 
 
 if TYPE_CHECKING:
-    Property = Keyvalues  #: :deprecated: Use srctools.Keyvalues.
+    # Do things statically for checkers.
+    Property = Keyvalues
+    __version__: str
+
+    from srctools.math import Vec_tuple  # noqa # Deprecated.
+    from srctools.vmf import VMF, Entity, Solid, Side, Output, UVAxis
+    from srctools.filesys import FileSystem, FileSystemChain, get_filesystem
+    from srctools.vpk import VPK
+    from srctools.fgd import FGD
+    from srctools.const import GameID
+    from srctools.surfaceprop import SurfaceProp, SurfChar
+    from srctools.vtf import VTF
 else:
     def __getattr__(name: str) -> object:
+        """Lazy load various names, and raise warnings for others."""
+        # Import into globals, so the second time it's fetched directly. We're just saving
+        # on imports, so just load a whole module at once.
+        global VMF, Entity, Solid, Side, Output, UVAxis
+        global FileSystem, FileSystemChain, get_filesystem
+        global VPK, FGD, GameID, SurfaceProp, SurfChar, VTF
         if name == 'Property':
             warnings.warn(
                 'srctools.Property is renamed to srctools.Keyvalues',
@@ -603,7 +596,41 @@ else:
                 stacklevel=2,
             )
             return Keyvalues
-        raise AttributeError(name)
+        elif name == '__version__':
+            warnings.warn(
+                'Use importlib.metadata instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            from importlib.metadata import version
+            return version('srctools')
+        elif name == 'Vec_tuple':
+            warnings.warn(
+                'srctools.Vec_tuple should be replaced by srctools.math.FrozenVec',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            from .math import Vec_tuple
+            return Vec_tuple
+        elif name in {'VMF', 'Entity', 'Solid', 'Side', 'Output', 'UVAxis'}:
+            from .vmf import VMF, Entity, Solid, Side, Output, UVAxis
+        elif name in {'FileSystem', 'FileSystemChain', 'get_filesystem'}:
+            from .filesys import FileSystem, FileSystemChain, get_filesystem
+        elif name == 'VPK':
+            from .vpk import VPK
+        elif name == 'FGD':
+            from .fgd import FGD
+        elif name == 'GameID':
+            from .const import GameID
+        elif name in {'SurfaceProp', 'SurfChar'}:
+            from .surfaceprop import SurfaceProp, SurfChar
+        elif name == 'VTF':
+            from .vtf import VTF
+        else:
+            raise AttributeError(name)
+        # The ones with warnings return, so if we get here we successfully did a lazy import.
+        # Those are in globals, so it should now work normally.
+        return globals()[name]
 
     try:
         from ._math import conv_int, conv_float, conv_bool

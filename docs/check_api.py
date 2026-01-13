@@ -12,18 +12,28 @@ import enum
 
 from sphinx.util.inventory import InventoryFile
 
-import srctools
-
 # Don't use Cython modules, they're harder to introspect.
 sys.modules['srctools._math'] = None
 sys.modules['srctools._tokenizer'] = None
 sys.modules['srctools._cy_vtf_readwrite'] = None
 
+import srctools
+
+# These alias something else, so we don't want to recurse into them.
+ALIASES = {
+    'srctools.dmx.AngleTup': 'srctools.math.FrozenAngle',
+    'srctools.dmx.Vec3': 'srctools.math.FrozenVec',
+    'srctools.bsp.BrushContents': 'srctools.const.BSPContents',
+    'srctools.fgd.KeyValues': 'srctools.fgd.KVDef',
+}
+
 
 def search_modules() -> Iterator[types.ModuleType]:
     """List all the srctools modules."""
     for info in pkgutil.iter_modules(srctools.__path__, 'srctools.'):
-        if info.name.startswith('srctools._') or info.name in ['srctools.scripts', 'srctools.vec']:
+        if info.name.startswith('srctools._') or info.name in {
+            'srctools.scripts', 'srctools.vec', 'srctools.property_parser'
+        }:
             # Ignore:
             # - Private internals.
             # - Non-API scripts
@@ -48,7 +58,9 @@ def find_api(mod: types.ModuleType) -> Iterator[str]:
         except AttributeError:
             print(f'Missing attr: {mod_name}.{name}!', file=sys.stderr)
             continue
-        yield f'{mod_name}.{name}'
+        yield (qualname := f'{mod_name}.{name}')
+        if qualname in ALIASES:
+            continue
         if isinstance(obj, type):
             # Recurse.
             is_enum = issubclass(obj, enum.Enum)
@@ -83,10 +95,13 @@ def main() -> int:
 
     for mod in search_modules():
         print('Module:', mod.__name__)
+        show = False  # (mod.__name__ == 'srctools.vmf')
         for name in find_api(mod):
             api.add(name)
             if name not in documented:
                 missing.add(name)
+            if show:
+                print(name)
         if not hasattr(mod, '__all__'):
             print(f'No {mod.__name__}.__all__!')
 
@@ -95,9 +110,8 @@ def main() -> int:
         print('Missing:', file=sys.stderr)
         for name in sorted(missing):
             print(' *', name, file=sys.stderr)
-        print('Count:', len(missing), file=sys.stderr)
-        return 1
-    return 0
+    print(f'Missing: {len(missing)}/{len(api)}', file=sys.stderr)
+    return 1 if missing else 0
 
 
 if __name__ == '__main__':

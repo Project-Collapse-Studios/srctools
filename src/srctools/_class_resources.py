@@ -1,6 +1,12 @@
-"""This module defines functions which list resources for various entities with special functionality."""
-from typing import Callable, Dict, Final, Iterator, Mapping, Sequence, TypeVar, Union
+"""This module defines functions which list resources for various entities with special functionality.
+
+Each function here should be registered via @cls_func, with its name used as the key in FGD resources.
+Use the context and entity to determine values, keeping in mind the ent could be missing keys.
+As a convenience yielding a blank resource is ignored.
+"""
+from typing import Callable, Final, TypeVar, Union
 from typing_extensions import TypeAlias
+from collections.abc import Iterator, Mapping, Sequence
 from enum import IntEnum
 import itertools
 
@@ -14,9 +20,10 @@ from .vmf import VMF, Entity
 ResGen: TypeAlias = Iterator[Union[Resource, Entity]]
 ClassFunc: TypeAlias = Callable[[ResourceCtx, Entity], ResGen]
 ClassFuncT = TypeVar('ClassFuncT', bound=ClassFunc)
-CLASS_FUNCS: Dict[str, ClassFunc] = {}
+CLASS_FUNCS: dict[str, ClassFunc] = {}
 # Dummy VMF, we create entities from this to pass back to recursively get resources for.
 _blank_vmf = VMF(preserve_ids=False)
+NO_TAGS: frozenset[str] = frozenset()  # Allows not needing a keyword argument in some calls.
 
 FLAG_NPC_START_EFFICENT = 1 << 4
 FLAG_NPC_DROP_HEALTHKIT = 1 << 3
@@ -257,6 +264,7 @@ BREAKABLE_SPAWNS_HL1: Mapping[int, str] = {
 }
 
 
+@cls_func
 def base_plat_train(ctx: ResourceCtx, ent: Entity) -> ResGen:
     """Check for HL1 train movement sounds."""
     if 'movesnd' in ent:
@@ -278,14 +286,18 @@ def base_plat_train(ctx: ResourceCtx, ent: Entity) -> ResGen:
 @cls_func
 def breakable_brush(ctx: ResourceCtx, ent: Entity) -> ResGen:
     """Breakable brushes are able to spawn specific entities."""
-    mat_type = conv_int(ent['material'])
-    if mat_type == 4:  # Cinderblocks - not clear which branch has what, include both.
-        yield Resource('CeilingTile', FileType.BREAKABLE_CHUNK)
-        yield Resource('ConcreteChunks', FileType.BREAKABLE_CHUNK)
-    elif mat_type == 9:  # Web, P2 metal panel
-        yield Resource('MetalPanelChunks' if 'P2' in ctx.tags else 'WebGibs', FileType.BREAKABLE_CHUNK)
+    if chunk := ent['gibmodel']:
+        # This overrides the presets.
+        yield Resource(chunk, FileType.BREAKABLE_CHUNK)
     else:
-        yield Resource(MATERIAL_GIB_TYPES.get(mat_type, 'WoodChunks'), FileType.BREAKABLE_CHUNK)
+        mat_type = conv_int(ent['material'])
+        if mat_type == 4:  # Cinderblocks - not clear which branch has what, include both.
+            yield Resource('CeilingTile', FileType.BREAKABLE_CHUNK)
+            yield Resource('ConcreteChunks', FileType.BREAKABLE_CHUNK)
+        elif mat_type == 9:  # Web, P2 metal panel
+            yield Resource('MetalPanelChunks' if 'P2' in ctx.tags else 'WebGibs', FileType.BREAKABLE_CHUNK)
+        else:
+            yield Resource(MATERIAL_GIB_TYPES.get(mat_type, 'WoodChunks'), FileType.BREAKABLE_CHUNK)
     object_ind = conv_int(ent['spawnobject'])
     spawns = BREAKABLE_SPAWNS_HL1 if 'HLS' in ctx.tags else BREAKABLE_SPAWNS
     # 27+ is Black Mesa exclusive.
@@ -411,27 +423,26 @@ SHOOTER_SOUNDS = [
 @cls_func
 def env_shooter(ctx: ResourceCtx, ent: Entity) -> ResGen:
     """A hardcoded array of sounds to play."""
-    try:
-        yield SHOOTER_SOUNDS[conv_int(ent['shootsounds'])]
-    except IndexError:
-        pass
+    shoot_ind = conv_int(ent['shootsounds'])
+    # -1 is the default value, meaning nothing.
+    if 0 <= shoot_ind < len(SHOOTER_SOUNDS):
+        yield SHOOTER_SOUNDS[shoot_ind]
 
     # Valve does this same check.
-    if ent['shootmodel'].casefold().endswith('.vmt'):
-        yield Resource.mat(ent['shootmodel'])
+    if (mdl := ent['shootmodel']).casefold().endswith('.vmt'):
+        yield Resource.mat(mdl)
     else:
-        yield Resource.mdl(ent['shootmodel'])
+        yield Resource.mdl(mdl, skinset=conv_int(ent['skin']))
 
 
 @cls_func
 def env_smokestack(ctx: ResourceCtx, ent: Entity) -> ResGen:
     """This tries using each numeric material that exists."""
-    mat_base = ent['smokematerial'].casefold().replace('\\', '/')
+    mat_base = ent['smokematerial'].casefold()
+    mat_base = mat_base.replace('\\', '/').removesuffix(".vmt")
     if not mat_base:
         return
 
-    if mat_base.endswith('.vmt'):
-        mat_base = mat_base[:-4]
     if not mat_base.startswith('materials/'):
         mat_base = 'materials/' + mat_base
 
@@ -503,20 +514,21 @@ def item_item_crate(ctx: ResourceCtx, ent: Entity) -> ResGen:
 @cls_func
 def item_teamflag(ctx: ResourceCtx, ent: Entity) -> ResGen:
     """This item has several special team-specific options."""
-    for kvalue, prefix in [
-        ('flag_icon', 'materials/vgui/'),
-        ('flag_trail', 'materials/effects/')
+    icon = ent['flag_icon'] or '../hud/objectives_flagpanel_carried'
+    trail = ent['flag_trail'] or 'flagtrail'
+
+    for prefix, mat in [
+        ('materials/vgui/', f'{icon}_red.vmt'),
+        ('materials/vgui/', f'{icon}_blue.vmt'),
+        ('materials/effects/', f'{trail}_red.vmt'),
+        ('materials/effects/', f'{trail}_blu.vmt'),
     ]:
-        value = ent[kvalue]
-        if value:
-            # Allow going up one directory - this is done by Valve in the icon.
-            # Going up two outside materials/ doesn't make any sense.
-            if value.startswith(('../', '..\\')):
-                folder = f'materials/{value[3:]}'
-            else:
-                folder = prefix + value
-            yield Resource.mat(folder + '_red.vmt')
-            yield Resource.mat(folder + '_blue.vmt')
+        # Allow going up one directory - this is done by Valve in the icon.
+        # Going up two outside materials/ doesn't make any sense.
+        if mat.startswith(('../', '..\\')):
+            yield Resource.mat(f'materials/{mat[3:]}')
+        else:
+            yield Resource.mat(f'{prefix}{mat}')
 
 
 EZ_MODEL_FOLDERS = [
@@ -540,7 +552,7 @@ def item_ammo_ar2_altfire(ctx: ResourceCtx, ent: Entity) -> ResGen:
     variant = conv_int(ent['ezvariant'])
     model, skin, snd = EZ_MODEL_FOLDERS[variant]
 
-    yield Resource.mdl(f'models/items/{model}combine_rifle_ammo01.mdl#{skin}')
+    yield Resource.mdl(f'models/items/{model}combine_rifle_ammo01.mdl', NO_TAGS, skin)
 
 
 @cls_func
@@ -551,7 +563,7 @@ def item_battery(ctx: ResourceCtx, ent: Entity) -> ResGen:
     variant = conv_int(ent['ezvariant'])
     model, skin, snd = EZ_MODEL_FOLDERS[variant]
 
-    yield Resource.mdl(f'models/items/{model}battery.mdl#{skin}')
+    yield Resource.mdl(f'models/items/{model}battery.mdl', NO_TAGS, skin)
 
 
 @cls_func
@@ -564,9 +576,9 @@ def item_healthkit(ctx: ResourceCtx, ent: Entity, kind: str = 'kit') -> ResGen:
 
     if kind == 'vial' and model == '':
         # Special case, the regular model is not in items.
-        yield Resource.mdl('models/healthvial.mdl#0')
+        yield Resource.mdl('models/healthvial.mdl', NO_TAGS, 0)
     else:
-        yield Resource.mdl(f'models/items/{model}health{kind}.mdl#{skin}')
+        yield Resource.mdl(f'models/items/{model}health{kind}.mdl', NO_TAGS, skin)
     yield Resource.snd(f'Health{kind.title()}{snd}.Touch')
 
 
@@ -939,13 +951,18 @@ def prop_door_rotating(ctx: ResourceCtx, ent: Entity) -> ResGen:
     """Parse the special door_options block."""
     try:
         mdl = Model(ctx.fsys, ctx.fsys[ent['model']])
-        kv = Keyvalues.parse(mdl.keyvalues, single_line=True).find_key('door_options')
+        kv = Keyvalues.parse(mdl.keyvalues, single_line=True).find_block('door_options')
     except (OSError, KeyValError, NoKeyError):
         return
-    skin = kv.find_key(f'skin{ent["skin"]}', or_blank=True)
-    hardware_key = kv.find_key(f'hardware{ent["hardware"]}', or_blank=True)
-    defaults = kv.find_key('defaults', or_blank=True)
-    for key in ['open', 'close', 'move']:
+    skin = kv.find_block(f'skin{ent["skin"]}', or_blank=True)
+    hardware_key = kv.find_block(f'hardware{ent["hardware"]}', or_blank=True)
+    # Both names are possible.
+    try:
+        defaults = kv.find_block('defaults')
+    except NoKeyError:
+        defaults = kv.find_block('default', or_blank=True)
+    # 'pound' is for L4D infected, assuming it's not based on hardware.
+    for key in ['open', 'close', 'move', 'pound']:
         try:
             yield Resource.snd(skin[key])
         except LookupError:
@@ -955,7 +972,15 @@ def prop_door_rotating(ctx: ResourceCtx, ent: Entity) -> ResGen:
             yield Resource.snd(hardware_key[key])
         except LookupError:
             yield Resource.snd(defaults[key, ''])
-
+    # L4D/CSGO has damage1/2/3 models, but just look for any key.
+    damage_keys = set()
+    for child in skin:
+        if child.name.startswith('damage'):
+            yield Resource.mdl(child.value)
+            damage_keys.add(child.name)
+    for child in defaults:
+        if child.name.startswith('damage') and child.name not in damage_keys:
+            yield Resource.mdl(child.value)
 
 @cls_func
 def skybox_swapper(ctx: ResourceCtx, ent: Entity) -> ResGen:
