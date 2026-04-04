@@ -12,6 +12,7 @@ import io
 import attrs
 
 from . import conv_int, bool_as_int
+from .binformat import strip_cstring, pad_cstring
 from .keyvalues import Keyvalues
 from .tokenizer import Tokenizer, Token
 from .types import FileWBinary
@@ -63,6 +64,12 @@ SPECIAL_NAMES = {
     SpecialCommand.RENAME_FILE: 'Rename File',
     SpecialCommand.STRATA_COPY_FILE_IF_EXISTS: 'Copy File if it Exists',
 }
+SPECIAL_IND: Mapping[int, Optional[SpecialCommand]] = {
+    cmd.value: cmd for cmd in SpecialCommand
+} | {
+    0: None,
+    260: SpecialCommand.STRATA_COPY_FILE_IF_EXISTS
+}
 STRATA_NAME_TO_SPECIAL: Mapping[str, Optional[SpecialCommand]] = {
     'none': None,
     'change_dir': SpecialCommand.CHANGE_DIR,
@@ -72,25 +79,6 @@ STRATA_NAME_TO_SPECIAL: Mapping[str, Optional[SpecialCommand]] = {
     'copy_file_if_exists': SpecialCommand.STRATA_COPY_FILE_IF_EXISTS,
 }
 SPECIAL_TO_STRATA_NAME = {cmd: name for name, cmd in STRATA_NAME_TO_SPECIAL.items()}
-
-
-def strip_cstring(data: bytes) -> str:
-    """Strip strings to the first null, and convert to ascii.
-
-    The CmdSeq files appear to often have junk data in the unused
-    sections after the null byte, where C code doesn't touch.
-    """
-    if b'\0' in data:
-        return data[:data.index(b'\0')].decode('ascii')
-    else:
-        return data.decode('ascii')
-
-
-def pad_string(text: str, length: int) -> bytes:
-    """Pad the string to the specified length and convert."""
-    if len(text) > length:
-        raise ValueError(f'{text!r} is longer than {length}!')
-    return text.encode('ascii') + b'\0' * (length - len(text))
 
 
 @attrs.define
@@ -210,7 +198,7 @@ def write(sequences: Mapping[str, Sequence[Command]], file: FileWBinary) -> None
     file.write(pack('I', len(sequences)))
 
     for name, commands in sequences.items():
-        file.write(pad_string(name, 128))
+        file.write(pad_cstring(name, 128))
         file.write(pack('I', len(commands)))
         for cmd in commands:
             if isinstance(cmd.exe, SpecialCommand):
@@ -221,7 +209,7 @@ def write(sequences: Mapping[str, Sequence[Command]], file: FileWBinary) -> None
                 exe = cmd.exe
 
             if cmd.ensure_file is not None:
-                ensure_file = pad_string(cmd.ensure_file, 260)
+                ensure_file = pad_cstring(cmd.ensure_file, 260)
                 has_ensure_file = 1
             else:
                 ensure_file = bytes(260)
@@ -230,8 +218,8 @@ def write(sequences: Mapping[str, Sequence[Command]], file: FileWBinary) -> None
             file.write(ST_COMMAND.pack(
                 cmd.enabled,
                 special,
-                pad_string(exe, 260),
-                pad_string(cmd.args, 260),
+                pad_cstring(exe, 260),
+                pad_cstring(cmd.args, 260),
                 True,  # is_long_filename
                 has_ensure_file,
                 ensure_file,
@@ -255,13 +243,20 @@ def parse_keyvalues(kv: Keyvalues) -> dict[str, list[Command]]:
             special_str = command_kv['special_cmd', command_kv['specialcmd', 'none']]
             special_cmd: Optional[SpecialCommand]
             if special_str.isdigit():
-                special_num = int(special_str)
-                special_cmd = None if special_num == 0 else SpecialCommand(special_num)
+                special_cmd = SPECIAL_IND[int(special_str)]
             else:
                 special_cmd = STRATA_NAME_TO_SPECIAL[special_str.casefold()]
             executable = special_cmd if special_cmd is not None else command_kv['run']
+
+            if 'params' in command_kv:  # Strata
+                args = command_kv['params']
+            elif 'parms' in command_kv:  # Hammer++
+                args = command_kv['parms'].replace('\x1b', '"')
+            else:
+                args = ''
+
             if command_kv.bool('ensure_check'):
-                ensure_file = command_kv['ensure_fn', '']
+                ensure_file = command_kv['ensure_fn', ''].replace('\x1b', '"')
             else:
                 ensure_file = None
 
@@ -269,7 +264,7 @@ def parse_keyvalues(kv: Keyvalues) -> dict[str, list[Command]]:
                 # First is Strata, second is H++.
                 enabled=command_kv.bool('enabled', command_kv.bool('enable', True)),
                 exe=executable,
-                args=command_kv['params', ''],
+                args=args,
                 ensure_file=ensure_file,
                 no_wait=command_kv.bool('no_wait'),
                 use_proc_win=command_kv.bool('use_process_wnd', True),
@@ -283,7 +278,7 @@ def build_keyvalues(
 ) -> Keyvalues:
     """Build Strata Source's or Hammer++'s keyvalues file format, for export.
 
-    :param file_format: The file format to produce, `"strata"` or `"hammer++"`. Hammer++ does not
+    :param file_format: The file format to produce, ``"strata"`` or ``"hammer++"``. Hammer++ does not
         support the `~Command.ensure_file`, `~Command.use_proc_win` or `~Command.no_wait` attributes.
     :param sequences: The sequences to build. The keys are the name of the commands.
     """
@@ -310,24 +305,28 @@ def build_keyvalues(
                 else:
                     cmd.append(Keyvalues('special_cmd', 'none'))
                     cmd.append(Keyvalues('run', command.exe))
+                cmd.append(Keyvalues('params', command.args))
             else:
                 if isinstance(command.exe, SpecialCommand):
                     cmd.append(Keyvalues('specialcmd', str(command.exe.value)))
                 else:
                     cmd.append(Keyvalues('specialcmd', '0'))
                     cmd.append(Keyvalues('run', command.exe))
-            cmd.append(Keyvalues('params', command.args))
-            if not is_strata:  # H++ doesn't include all of these.
-                continue
+                cmd.append(Keyvalues('parms', command.args.replace('"', '\x1b')))
             cmd.append(Keyvalues(
                 'ensure_check',
                 bool_as_int(command.ensure_file is not None)
             ))
             if command.ensure_file is not None:
-                cmd.append(Keyvalues('ensure_fn', command.ensure_file))
-            # These do nothing, so only export if they have non-default values.
-            if not command.use_proc_win:
-                cmd.append(Keyvalues('use_process_wnd', '0'))
-            if command.no_wait:
-                cmd.append(Keyvalues('no_wait', '1'))
+                file = command.ensure_file
+                if not is_strata:
+                    file = file.replace('"', '\x1b')
+                cmd.append(Keyvalues('ensure_fn', file))
+
+            if is_strata:  # H++ doesn't include thsese.
+                # These do nothing, so only export if they have non-default values.
+                if not command.use_proc_win:
+                    cmd.append(Keyvalues('use_process_wnd', '0'))
+                if command.no_wait:
+                    cmd.append(Keyvalues('no_wait', '1'))
     return root

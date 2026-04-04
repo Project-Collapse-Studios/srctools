@@ -32,6 +32,7 @@ from srctools.tokenizer import Token, Tokenizer, escape_text
 from srctools.vmf import VMF, Entity, Output
 from srctools.vmt import Material
 from srctools.vtf import VTF
+from srctools.dmx import Color
 
 
 __all__ = [
@@ -53,9 +54,6 @@ BSP_MAGIC = b'VBSP'  # All BSP files start with this
 VITAMIN_MAGIC = b'FART'  # Desolation's branch of Source.
 HEADER_1 = '<4si'  # Header section before the lump list.
 HEADER_LUMP = '<4i'  # Header section for each lump.
-HEADER_2 = '<i'  # Header section after the lumps.
-OVERLAY_FACE_COUNT = 64  # Max number of overlay faces.
-TEXINFO_IND_TYPE = 'h'  # The type used to index into texinfo (i or h).
 
 T = TypeVar('T')
 KeyT = TypeVar('KeyT')  # Needs to be hashable, typecheckers currently don't handle that.
@@ -251,6 +249,9 @@ class LumpDataLayout(TypedDict):
     EDGE: struct.Struct
     PRIMITIVE: struct.Struct
     PRIMINDEX: struct.Struct
+    # Start of overlays, this varies depending on whether texinfo is 2 or 4 bytes.
+    OVERLAY_START: str
+    OVERLAY_FACE_COUNT: int  # Max number of overlay faces.
     NODE: struct.Struct
     LEAF: struct.Struct
     LEAFFACE: struct.Struct
@@ -270,6 +271,8 @@ LUMP_LAYOUT_STANDARD: LumpDataLayout = {
     "PRIMINDEX":        struct.Struct('<H'),
     "NODE":             struct.Struct('<iii6hHHh2x'),
     "LEAF":             struct.Struct('<ihh6h4Hh2x'),  # Version 1
+    "OVERLAY_START":   'IhH',
+    "OVERLAY_FACE_COUNT": 64,
     "LEAFFACE":         struct.Struct('<H'),
     "LEAFBRUSH":        struct.Struct('<H'),
     "LEAF_AREA_OFFSET": 7,
@@ -278,6 +281,7 @@ LUMP_LAYOUT_STANDARD: LumpDataLayout = {
     "STATICPROPLEAF":   struct.Struct('<H'),
 }
 
+TEXINFO_IND_TYPE = 'h'  # The type used to index into texinfo (i or h).
 
 LUMP_LAYOUT_V19: LumpDataLayout = {
     **LUMP_LAYOUT_STANDARD,
@@ -300,6 +304,7 @@ LUMP_LAYOUT_VITAMIN: LumpDataLayout = {
     "FACE": struct.Struct('<5i4iB3x'),
     "BRUSHSIDE": struct.Struct('<IIhBB'),
     "NODE": struct.Struct('<iii6iHHh2x'),
+    "OVERLAY_START": 'IiI',
 }
 
 # https://wiki.stratasource.org/modding/overview/bsp-v25
@@ -314,6 +319,7 @@ LUMP_LAYOUT_STRATA: LumpDataLayout = {
     "LEAF":             struct.Struct('<iii6f4Ii'),  # Version 2
     "LEAFFACE":         struct.Struct('<I'),
     "LEAFBRUSH":        struct.Struct('<I'),
+    "OVERLAY_START": 'IiI',
     "LEAF_AREA_OFFSET": 17,
     "LEAFWATERDATA":    struct.Struct('<ffI'),
     "BRUSHSIDE":        struct.Struct('<IiiHxx'),
@@ -940,37 +946,76 @@ class Cubemap:
 _ZERO: int = int('0')
 
 
-@attrs.define(eq=False)
+@attrs.define(eq=False, kw_only=True)
 class Overlay:
     """An overlay embedded in the map."""
     id: int = attrs.field(eq=True)
     origin: Vec
     normal: Vec
+    basis_u: FrozenVec
+    basis_v_flipped: bool = False  # This is calculated from cross(normal, basis_u)
     texture: TexInfo
-    face_count: int
     faces: list[int] = attrs.field(factory=list, validator=attrs.validators.deep_iterable(
         attrs.validators.instance_of(int),
         attrs.validators.instance_of(list),
     ))
     render_order: int = attrs.field(default=_ZERO, validator=attrs.validators.in_(range(4)))
+    #: Strata Source addition, a tint for the overlay.
+    tint: Color = attrs.field(default=Color(255, 255, 255), kw_only=True)
     u_min: float = 0.0
     u_max: float = 1.0
     v_min: float = 0.0
     v_max: float = 1.0
-    # Four corner handles of the overlay.
-    uv1: Vec = attrs.field(factory=lambda: Vec(-16, -16))
-    uv2: Vec = attrs.field(factory=lambda: Vec(-16, +16))
-    uv3: Vec = attrs.field(factory=lambda: Vec(+16, +16))
-    uv4: Vec = attrs.field(factory=lambda: Vec(+16, -16))
+    #: Four corner handles of the overlay. Z is unused - the basis U/V values are stored here.
+    uv1: FrozenVec = FrozenVec(-16, -16)
+    uv2: FrozenVec = FrozenVec(-16, +16)
+    uv3: FrozenVec = FrozenVec(+16, +16)
+    uv4: FrozenVec = FrozenVec(+16, -16)
 
     fade_min_sq: float = -1.0
     fade_max_sq: float = 0.0
 
-    # If system exceeds these limits, the overlay is skipped. Each is a single byte.
+    #: If system exceeds these limits, the overlay is skipped. Each is a single byte.
     min_cpu: int = attrs.field(default=_ZERO, validator=attrs.validators.in_(range(255)))
     max_cpu: int = attrs.field(default=_ZERO, validator=attrs.validators.in_(range(255)))
     min_gpu: int = attrs.field(default=_ZERO, validator=attrs.validators.in_(range(255)))
     max_gpu: int = attrs.field(default=_ZERO, validator=attrs.validators.in_(range(255)))
+
+    @property
+    def basis_v(self) -> FrozenVec:
+        """The basis V value is calculated from the normal and basis u."""
+        result = FrozenVec.cross(self.normal, self.basis_u)
+        return -result if self.basis_v_flipped else result
+
+    @property
+    def fade_min(self) -> float:
+        """Non-squared version of the fade_min value."""
+        if self.fade_min_sq > 0:
+            return math.sqrt(self.fade_min_sq)
+        else:
+            return self.fade_min_sq  # -1 or 0.
+
+    @fade_min.setter
+    def fade_min(self, value: float) -> None:
+        if value > 0:
+            self.fade_min_sq = value ** 2
+        else:
+            self.fade_min_sq = value
+
+    @property
+    def fade_max(self) -> float:
+        """Non-squared version of the fade_max value."""
+        if self.fade_max_sq > 0:
+            return math.sqrt(self.fade_max_sq)
+        else:
+            return self.fade_max_sq  # -1 or 0.
+
+    @fade_max.setter
+    def fade_max(self, value: float) -> None:
+        if value > 0:
+            self.fade_max_sq = value ** 2
+        else:
+            self.fade_max_sq = value
 
 
 @attrs.define(eq=False)
@@ -1289,6 +1334,7 @@ class ParsedLump(Generic[T]):
         # Args are (BSP, version, data) if game lump, else (BSP, data).
         self._read: Optional[Callable[..., T]] = None
         self._check: Optional[Callable[[BSP, T], None]] = None
+        self._default: Optional[Callable[[], T]] = None
         assert self.lump in LUMP_REBUILD_ORDER, self.lump
 
     def __set_name__(self, owner: type['BSP'], name: str) -> None:
@@ -1297,6 +1343,7 @@ class ParsedLump(Generic[T]):
         self.__objclass__ = owner
         self._read = getattr(owner, '_lmp_read_' + func_suffix)
         self._check = getattr(owner, '_lmp_check_' + func_suffix, None)
+        self._default = getattr(owner, '_lump_init_' + func_suffix, None)
         # noinspection PyProtectedMember
         owner._save_funcs[self.lump] = getattr(owner, '_lmp_write_' + func_suffix)
 
@@ -1322,11 +1369,25 @@ class ParsedLump(Generic[T]):
         if self._read is None:
             raise TypeError('ParsedLump.__set_name__ was never called!')
         if isinstance(self.lump, BSP_LUMPS):
-            data = instance.lumps[self.lump].data
+            try:
+                data = instance.lumps[self.lump].data
+            except KeyError:
+                if self._default is not None:
+                    # noinspection PyProtectedMember
+                    instance._parsed_lumps[self.lump] = result = self._default()
+                    return result
+                raise
             LOGGER.debug('Load game lump {} ({} bytes)', self.lump, len(data))
             result = self._read(instance, data)
         else:  # Game lump
-            gm_lump = instance.game_lumps[self.lump]
+            try:
+                gm_lump = instance.game_lumps[self.lump]
+            except KeyError:
+                if self._default is not None:
+                    # noinspection PyProtectedMember
+                    instance._parsed_lumps[self.lump] = result = self._default()
+                    return result
+                raise
             LOGGER.debug('Load game lump {} v{} ({} bytes)', self.lump, gm_lump.version, len(gm_lump.data))
             result = self._read(instance, gm_lump.version, gm_lump.data)
         if inspect.isgenerator(result):  # Convenience, yield to accumulate into a list.
@@ -1531,7 +1592,7 @@ class BSP:
                 )
                 lump_offsets[lump_id] = offset, length, uncomp_size
 
-            [self.map_revision] = struct_read(HEADER_2, file)
+            [self.map_revision] = struct_read('i', file)
 
             for lump in self.lumps.values():
                 # Now read in each lump.
@@ -1655,7 +1716,7 @@ class BSP:
                 defer.defer(lump_name, HEADER_LUMP, write=True)
 
             # After lump headers, the map revision...
-            file.write(struct.pack(HEADER_2, self.map_revision))
+            file.write(struct.pack('i', self.map_revision))
 
             # Then each lump.
             for lump_name in LUMP_WRITE_ORDER:
@@ -2134,10 +2195,11 @@ class BSP:
                 dynamic_shadows = not (prim_num & 0x8000)
                 vitamin_flags = 0
 
-                # If orig faces is provided, that is the original face
+                # If orig faces is provided and non-empty, that is the original face
                 # we were created from. Additionally, it seems the original
                 # face data has invalid texinfo, so copy ours on top of it.
-                if orig_faces is not None:
+                # VBSP++ with -cullverts also strips the lump, so it'll be empty in that case.
+                if orig_faces:
                     orig_face = orig_faces[orig_face_ind]
                     orig_face.texinfo = texinfo = self.texinfo[texinfo_ind]
                     try:
@@ -2782,6 +2844,12 @@ class BSP:
         phys_buf.write(struct.pack('<iiii', -1, 0, 0, 0))
         self.lumps[BSP_LUMPS.PHYSCOLLIDE].data = phys_buf.getvalue()
 
+    def _lmp_init_pakfile(self) -> ZipFile:
+        """Create a new packfile."""
+        zipfile = ZipFile(BytesIO(), mode='a')
+        zipfile.filename = os.fspath(self.filename)
+        return zipfile
+
     def _lmp_read_pakfile(self, data: bytes) -> ZipFile:
         """Read the raw binary as writable zip archive."""
         zipfile = ZipFile(BytesIO(data), mode='a')
@@ -2823,20 +2891,36 @@ class BSP:
                 cube.size,
             )
 
+    def _lmp_init_overlays(self) -> list[Overlay]:
+        """Make a blank overlay lump."""
+        return []
+
     def _lmp_read_overlays(self, data: bytes) -> Iterator[Overlay]:
         """Read the overlays lump."""
+        has_tint = (  # Strata Source addition, rendercolor tinting.
+            self.version == VERSIONS.STRATA_SOURCE and
+            self.lumps[BSP_LUMPS.OVERLAYS].version == 2
+        )
+        max_faces = self.lump_layout["OVERLAY_FACE_COUNT"]
+        if has_tint:
+            fmt_1 = ''  # Extra padding
+            fmt_2 = '4B'  # Render colour
+        else:
+            fmt_1 = fmt_2 = ''
+        lump_format = (
+            # ID, texinfo, face-and-render-order
+            f'{self.lump_layout["OVERLAY_START"]}'
+            f'{max_faces}i'  # face array.
+            f'{fmt_1}'
+            '4f'  # UV min/max
+            '18f'  # 4 handle points, origin, normal
+            f'{fmt_2}'
+        )
+
         # Use zip longest, so we handle cases where these newer auxiliary lumps
         # are empty.
         for block, fades, sys_levels in itertools.zip_longest(
-            struct.iter_unpack(
-                '<i'  # ID
-                # texinfo, face-and-render-order
-                f'{"iHxx" if TEXINFO_IND_TYPE == "i" else "hH"}'
-                f'{OVERLAY_FACE_COUNT}i'  # face array.
-                '4f'  # UV min/max
-                '18f',  # 4 handle points, origin, normal
-                data,
-            ),
+            struct.iter_unpack(lump_format, data),
             struct.iter_unpack('<ff', self.lumps[BSP_LUMPS.OVERLAY_FADES].data),
             struct.iter_unpack('<4B', self.lumps[BSP_LUMPS.OVERLAY_SYSTEM_LEVELS].data),
         ):
@@ -2844,25 +2928,36 @@ class BSP:
                 # Too many of either aux lump, ignore.
                 break
             over_id, texinfo, face_ro = block[:3]
+            # Render order and face count are packed together.
             face_count = face_ro & ((1 << 14) - 1)
             render_order = face_ro >> 14
-            if face_count > OVERLAY_FACE_COUNT:
-                raise ValueError(f'{face_ro} exceeds OVERLAY_BSP_FACE_COUNT ({OVERLAY_FACE_COUNT})!')
+            if face_count > max_faces:
+                raise ValueError(f'{face_ro} exceeds OVERLAY_BSP_FACE_COUNT ({max_faces})!')
             faces = list(block[3: 3 + face_count])
-            u_min, u_max, v_min, v_max = block[-22:-18]
-            uv1 = Vec(block[-18:-15])
-            uv2 = Vec(block[-15:-12])
-            uv3 = Vec(block[-12:-9])
-            uv4 = Vec(block[-9:-6])
-            origin = Vec(block[-6:-3])
-            normal = Vec(block[-3:])
-            assert len(block) == 25 + OVERLAY_FACE_COUNT
+            # Trim this off, so we can use constant indexes for the rest.
+            block = block[3 + max_faces:]
+            u_min, u_max, v_min, v_max = block[:4]
+            # The z-value for these are used for other things.
+            uv1 = FrozenVec(block[4], block[5])
+            uv2 = FrozenVec(block[7], block[8])
+            uv3 = FrozenVec(block[10], block[11])
+            uv4 = FrozenVec(block[13], block[14])
+            origin = Vec(block[16:19])
+            normal = Vec(block[19:22])
+            basis_u = FrozenVec(block[6], block[9], block[12])  # uv1-3 z values.
+            basis_v_flipped = block[15] > 0.5  # 1.0 or 0.0 normally.
+            if has_tint:
+                tint = Color(block[22], block[23], block[24], block[25])
+                assert len(block) == 26, f'{block}, {len(block)} elems'
+            else:
+                tint = Color(255, 255, 255)
+                assert len(block) == 22, f'{block}, {len(block)} elems'
 
             if fades is not None:
-                fade_min, fade_max = fades
+                fade_min_sq, fade_max_sq = fades
             else:
-                fade_min = -1.0
-                fade_max = 0.0
+                fade_min_sq = -1.0
+                fade_max_sq = 0.0
             if sys_levels is not None:
                 min_cpu, max_cpu, min_gpu, max_gpu = sys_levels
             else:
@@ -2870,15 +2965,20 @@ class BSP:
                 max_cpu = max_gpu = 0
 
             yield Overlay(
-                over_id, origin, normal,
-                self.texinfo[texinfo], face_count,
-                faces, render_order,
-                u_min, u_max,
-                v_min, v_max,
-                uv1, uv2, uv3, uv4,
-                fade_min, fade_max,
-                min_cpu, max_cpu,
-                min_gpu, max_gpu
+                id=over_id,
+                origin=origin,
+                normal=normal,
+                basis_u=basis_u,
+                basis_v_flipped=basis_v_flipped,
+                texture=self.texinfo[texinfo],
+                faces=faces, render_order=render_order,
+                u_min=u_min, u_max=u_max,
+                v_min=v_min, v_max=v_max,
+                uv1=uv1, uv2=uv2, uv3=uv3, uv4=uv4,
+                fade_min_sq=fade_min_sq, fade_max_sq=fade_max_sq,
+                min_cpu=min_cpu, max_cpu=max_cpu,
+                min_gpu=min_gpu, max_gpu=max_gpu,
+                tint=tint,
             )
 
     def _lmp_write_overlays(self, overlays: list[Overlay]) -> Iterator[bytes]:
@@ -2886,27 +2986,37 @@ class BSP:
         add_texinfo = find_or_insert(self.texinfo)
         fade_buf = BytesIO()
         levels_buf = BytesIO()
+        max_faces = self.lump_layout["OVERLAY_FACE_COUNT"]
+        has_tint = (  # Strata Source addition, changes padding too.
+            self.version == VERSIONS.STRATA_SOURCE and
+            self.lumps[BSP_LUMPS.OVERLAYS].version == 2
+        )
         for over in overlays:
             face_cnt = len(over.faces)
-            if face_cnt > OVERLAY_FACE_COUNT:
-                raise ValueError(f'{over.faces} exceeds OVERLAY_BSP_FACE_COUNT ({OVERLAY_FACE_COUNT})!')
+            if face_cnt > max_faces:
+                raise ValueError(f'{over.faces} exceeds OVERLAY_BSP_FACE_COUNT ({max_faces})!')
             fade_buf.write(struct.pack('<ff', over.fade_min_sq, over.fade_max_sq))
             levels_buf.write(struct.pack('<4B', over.min_cpu, over.max_cpu, over.min_gpu, over.max_gpu))
             yield struct.pack(
                 # texinfo, face-and-render-order
-                '<iiHxx' if TEXINFO_IND_TYPE == "i" else '<ihH',
+                '<' + self.lump_layout["OVERLAY_START"],
                 over.id,
                 add_texinfo(over.texture),
                 (over.render_order << 14 | face_cnt),
             )
             # Build the array, then zero fill the remaining space.
-            yield struct.pack(f'<{face_cnt}i {4*(OVERLAY_FACE_COUNT-face_cnt)}x', *over.faces)
+            yield struct.pack(f'<{face_cnt}i {4*(max_faces-face_cnt)}x', *over.faces)
             yield struct.pack('<4f', over.u_min, over.u_max, over.v_min, over.v_max)
             yield struct.pack(
                 '<18f',
-                *over.uv1, *over.uv2, *over.uv3, *over.uv4,
+                over.uv1.x, over.uv1.y, over.basis_u.x,
+                over.uv2.x, over.uv2.y, over.basis_u.y,
+                over.uv3.x, over.uv3.y, over.basis_u.z,
+                over.uv4.x, over.uv4.y, (1.0 if over.basis_v_flipped else 0.0),
                 *over.origin, *over.normal,
             )
+            if has_tint:
+                yield struct.pack('4B', *over.tint)
         self.lumps[BSP_LUMPS.OVERLAY_FADES].data = fade_buf.getvalue()
         self.lumps[BSP_LUMPS.OVERLAY_SYSTEM_LEVELS].data = levels_buf.getvalue()
 
@@ -3103,6 +3213,10 @@ class BSP:
         Deprecated, ``bsp.props`` is stored and resaved.
         """
         self.props = props
+
+    def _lmp_init_props(self) -> list[StaticProp]:
+        """Create a blank static prop lump."""
+        return []
 
     def _lmp_read_props(self, vers_num: int, data: bytes) -> Iterator['StaticProp']:
         # The version of the static prop format - different features.
