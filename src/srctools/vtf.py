@@ -9,7 +9,7 @@ not supported, only metdata can be read.
 .. _`Python Imaging Library`: https://pillow.readthedocs.io/en/stable/
 .. _`libsquish`: https://sourceforge.net/projects/libsquish/
 """
-from typing import TYPE_CHECKING, Any, Optional, Union, overload, ClassVar
+from typing import TYPE_CHECKING, Any, Optional, Union, overload, ClassVar, final
 from array import array
 from collections.abc import Iterator, Mapping, Sequence
 from enum import Enum, Flag
@@ -545,7 +545,7 @@ class Frame:
         return frombuffer(
             'RGBA',
             (self.width, self.height),
-            self._data,  # type: ignore  # frombuffer() incorrect.
+            self._data,
             'raw',
             'RGBA',
             0,
@@ -616,6 +616,7 @@ class Frame:
         return img
 
 
+@final
 class VTF:
     """Valve Texture Format files, used in the Source Engine."""
     width: int  #: The width of the texture. This must be a power of two, but does not need to match the height.
@@ -778,6 +779,10 @@ class VTF:
         vtf.format = fmt = FORMAT_ORDER[high_format]
         vtf.version = version_major, version_minor
         vtf.low_format = low_fmt = FORMAT_ORDER[low_format]
+        vtf.resources = {}
+        vtf.sheet_info = {}
+        vtf.hotspot_info = None
+        vtf.hotspot_flags = 0
 
         if fmt is ImageFormats.NONE:
             raise ValueError('High-res format cannot be missing!')
@@ -791,9 +796,6 @@ class VTF:
 
         low_res_offset = -1
         high_res_offset = -1
-
-        vtf.resources = {}
-        vtf.sheet_info = {}
 
         depth_seq = vtf._depth_range()
 

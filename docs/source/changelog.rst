@@ -8,13 +8,32 @@ Changelog
 -------------
 Version (dev)
 -------------
+
+* When exporting BSPs, treat game lumps are optional, omit if empty.
+* Ignore the first edge defined in BSPs, which should never be accessed.
+* Automatically create folders for cache filenames provided to :meth:`<Packlist.load_soundscript_manifest()> srctools.packlist.Packlist.load_soundscript_manifest`,
+  `PackList.load_choreo_scenes() <srctools.packlist.PackList.load_choreo_scenes>` and `PackList.load_soundscape_manifest() <srctools.packlist.PackList.load_soundscape_manifest>`.
+* Fix parsing of BSP static prop flags in TF2.
+
+-------------
+Version 2.7.0
+-------------
+
 * Add :mod:`srctools.sndscape`, for parsing soundscape scripts.
 * Changed `PackList.load_choreo_scenes() <srctools.packlist.PackList.load_choreo_scenes>` to warn if ``scenes.image`` is not found.
-* Add support for ``orientedwidthheight()``, ``orientedwidthheighthalf()`` and ``clusteredlight()`` Strata FGD helpers.
+* Change type for FGD keyvalue options to :class:`~srctools.fgd.KVOption`. Previous tuple attributes are deprecated.
+* Add support for ``orientedwidthheight()``, ``orientedwidthheighthalf()``, ``orientedboundingbox()`` and ``clusteredlight()`` Strata FGD helpers.
+* Add support for descriptions in spawnflags - displayed in Strata Source.
 * Add ``noinherit()`` FGD helper, for indicating values to avoid inheriting from base classes.
 * Add option to control double-quote escaping behaviour for FGDs, seperately to custom syntax.
 * Add support for parsing Strata's Keyvalues-based `~srctools.cmdseq` variant.
 * Allow customising the filename used for injected `~srctools.packlist.PackList` files.
+* Add support for parsing Strata's 'colorvars' system.
+* Add support for parsing Strata's v2 and v3 tintable overlays BSP format.
+* Rearrange `srctools.bsp.Overlay` attributes, parse basis U/V out of the 4 handle positions.
+* :src-issue:`43`: Fix incorrect export of displacement `triangle_tag` values.
+* :src-issue:`44`: Fix :meth:`VTF.read() <srctools.vtf.VTF.read>` not initalising `~srctools.vtf.VTF.hotspot_info` and `~srctools.vtf.VTF.hotspot_flags`.
+* Account for VBSP++'s :option:`--cullverts` parameter, which discards the original faces lump.
 
 -------------
 Version 2.6.2

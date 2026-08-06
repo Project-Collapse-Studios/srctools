@@ -1,10 +1,11 @@
 """Parse FGD files, used to describe Hammer entities."""
 from __future__ import annotations
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar, Union, cast
-from typing_extensions import Protocol, TypeAlias, overload, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar, Union
+from typing_extensions import Protocol, TypeAlias, overload, Self, deprecated
 from collections import ChainMap, defaultdict
 from collections.abc import (
     Callable, Collection, Container, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet,
+    MutableSequence,
 )
 from copy import deepcopy
 from enum import Enum
@@ -29,7 +30,7 @@ import srctools
 
 __all__ = [
     'ValueTypes', 'EntityTypes', 'HelperTypes', 'AutoVisgroup', 'FGDParseError',
-    'FGD', 'EntityDef', 'KVDef', 'IODef', 'EntAttribute', 'Helper', 'UnknownHelper',
+    'FGD', 'EntityDef', 'KVOption', 'KVDef', 'IODef', 'EntAttribute', 'Helper','UnknownHelper',
     'match_tags', 'validate_tags', 'Resource', 'ResourceCtx', 'Snippet', 'TagsSet',
 
     # From srctools._fgd_helpers
@@ -41,7 +42,7 @@ __all__ = [
     'HelperOrientedBBox', 'HelperOrigin', 'HelperOverlay',
     'HelperOverlayTransition', 'HelperRenderColor', 'HelperRope',
     'HelperSize', 'HelperSphere', 'HelperSprite',
-    'HelperSweptPlayerHull', 'HelperTrack', 'HelperTypes',
+    'HelperSweptPlayerHull', 'HelperTrack',
     'HelperVecLine', 'HelperWorldText',
 
     'HelperExtAppliesTo', 'HelperExtAutoVisgroups', 'HelperExtOrderBy',
@@ -286,6 +287,8 @@ class HelperTypes(Enum):
     STRATA_FLAT_OBB = 'orientedwidthheight'
     #: Strata Source addition, an oriented 2D bbox using half width/height values.
     STRATA_HALF_FLAT_OBB = 'orientedwidthheighthalf'
+    #: Strata Source addition, an oriented 3D bounding box.
+    STRATA_HALF_OBB = 'orientedboundingbox'
 
     ENT_LIGHT_CONE_BLACK_MESA = 'lightconenew'  #: New helper added in Black Mesa.
     ENT_STRATA_CLUSTERED_LIGHT = 'clusteredlight'  #: Helper for Strata's clustered lights.
@@ -313,6 +316,34 @@ class HelperTypes(Enum):
     def extension(self) -> bool:
         """Is this an extension to the format?"""
         return self.name.startswith('EXT_')
+
+
+@attrs.define(kw_only=True)
+class KVOption:
+    """One of the possible options for choices or spawnflags-type keyvalues."""
+    #: For flag KVs, the bitflag to use. Set to zero and ignored for choices.
+    bitflag: int = 0
+    value: str = ""  #: For choice KVs, the value associated with this option.
+    name: str = ""  #: Display name for the option.
+    desc: str = ""  #: Optional description, only available in Strata Source.
+    default: bool = False  #: For flag KVs, the default state of the flag.
+    tags: TagsSet = frozenset()  #: Tags associated with this option.
+
+    @classmethod
+    def make_choices(cls, value: str, name: str, *, tags: TagsSet = frozenset()) -> Self:
+        """Provide a constructor for choice-type options."""
+        return cls(value=value, name=name, tags=tags)
+
+    @classmethod
+    def make_flags(
+        cls, bitflag: int, name: str,
+        default: bool = True,
+        *,
+        desc: str = '',
+        tags: TagsSet = frozenset(),
+    ) -> Self:
+        """Provide a constructor for flag-type options."""
+        return cls(bitflag=bitflag, name=name, default=default, desc=desc, tags=tags)
 
 
 def add_engine_database(path: Path) -> None:
@@ -509,7 +540,7 @@ def _parse_colon_array(
 def _parse_flags(
     tok: BaseTokenizer, error_desc: str,
     first_value: str, vals: list[str], tags: TagsSet,
-) -> SpawnFlags:
+) -> KVOption:
     """Parse a line into a flags array member."""
     power: float
     if first_value.startswith(("^", "2^")):
@@ -543,33 +574,33 @@ def _parse_flags(
                 error_desc,
             )
     # Spawnflags can have a default, others may not.
-    if len(vals) == 2:
-        default = vals[1].strip() == '1'
-    elif len(vals) == 1:
-        default = True
-    elif len(vals) == 0:
-        raise tok.error('Expected value for spawnflags, got none!')
-    else:
+    if len(vals) > 3:
         raise tok.error(
             'Too many values for spawnflags definition in ({}):\n{}',
             error_desc, vals,
         )
+    elif len(vals) == 0:
+        raise tok.error('Expected value for spawnflags, got none!')
+
     name = vals[0]
+    default = vals[1].strip() == '1' if len(vals) >= 2 else True
+    desc = vals[2] if len(vals) >= 3 else ""
+
     # We optionally prepend [64] to spawnflags to show the numeric value.
     # Make sure we strip those to prevent duplication.
     generated_num = f'[{spawnflag}]'
     if name.startswith(generated_num):
         name = name[len(generated_num):].lstrip()
-    return spawnflag, name, default, tags
+    return KVOption(bitflag=spawnflag, value="", name=name, desc=desc, default=default, tags=tags)
 
 
 def _parse_choices(
     tok: BaseTokenizer, error_desc: str,
     first_value: str, vals: list[str], tags: TagsSet,
-) -> Choices:
+) -> KVOption:
     """Parse a line into a choices array member."""
     if len(vals) == 1:
-        return (first_value, vals[0], tags)
+        return KVOption(value=first_value, name=vals[0], tags=tags)
     elif len(vals) == 0:
         raise tok.error('Expected value for choices, got none (in {})!', error_desc)
     else:
@@ -1039,6 +1070,66 @@ class AutoVisgroup:
     ents: set[str] = attrs.field(factory=set, hash=False, eq=False, order=False)
 
 
+@attrs.define(eq=False, kw_only=True)
+class ColorVar:
+    """Strata Source feature, color vars allow tinting overlays and static props.
+
+    This informs Hammer of the vars available in a game, along with the default value
+    to preview the tinting.
+    """
+    name: str
+    long_name: str
+    red: int
+    green: int
+    blue: int
+    tags: TagsSet = frozenset()
+
+    @classmethod
+    def _parse(cls, tok: Tokenizer) -> Self:
+        """Parse a colorvar definition."""
+        # Format: @colorvar name[tags] = 255 255 255: "description"
+        # Tags and description are optional.
+        name = tok.expect(Token.STRING)
+        token, tok_value = tok()
+        if token is Token.BRACK_OPEN:
+            tags = read_tags(tok, Token.BRACK_CLOSE)
+            tok.expect(Token.EQUALS)
+        elif token is Token.EQUALS:
+            tags = frozenset()
+        else:
+            raise tok.error('Expected equals sign, but got {}({})', token, tok_value)
+        try:
+            red = int(tok.expect(Token.STRING))
+            green = int(tok.expect(Token.STRING))
+            blue = int(tok.expect(Token.STRING))
+        except (TypeError, ValueError) as exc:
+            raise tok.error('Invalid colorvar color!') from exc
+        token, tok_value = tok()
+        if token is Token.COLON:
+            long_name = tok.expect(Token.STRING)
+        else:
+            tok.push_back(token, tok_value)
+            long_name = ''
+        return cls(
+            name=name,
+            long_name=long_name,
+            red=red, green=green, blue=blue,
+            tags=tags,
+        )
+
+    def export(self, file: FileWText, custom_syntax: bool = True) -> None:
+        """Write out a colorvar directive."""
+        file.write(f'@colorvar {self.name}')
+        if self.tags and custom_syntax:
+            file.write(f'[{", ".join(sorted(self.tags))}]')
+        file.write(f' = {self.red} {self.green} {self.blue}')
+        if self.long_name:
+            # This is a Strata extension, escapes are always allowed.
+            file.write(f': "{escape_text(self.long_name)}"\n')
+        else:
+            file.write('\n')
+
+
 class EntAttribute:
     """Common base class for IODef and KVDef."""
     name: str
@@ -1073,20 +1164,90 @@ class EntAttribute:
             return None
 
 
+# noinspection PyMissingOrEmptyDocstring
+class _MapList(MutableSequence[T]):
+    """Temporary class to allow deprecating KVDef.val_list."""
+    def __init__(self, parent: KVDef, map_in: Callable[[T], KVOption], map_out: Callable[[KVOption], T]) -> None:
+        self._parent = parent
+        self._import = map_in
+        self._export = map_out
+
+    def __len__(self) -> int:
+        if self._parent.options is None:
+            return 0
+        return len(self._parent.options)
+
+    def insert(self, index: int, value: T) -> None:
+        if self._parent.options is None:
+            self._parent.options = []
+        self._parent.options.insert(index, self._import(value))
+
+    def append(self, value: T) -> None:
+        if self._parent.options is None:
+            self._parent.options = [self._import(value)]
+        else:
+            self._parent.options.append(self._import(value))
+
+    def reverse(self) -> None:
+        if self._parent.options is not None:
+            self._parent.options.reverse()
+
+    def clear(self) -> None:
+        self._parent.options = None
+
+    def __iter__(self) -> Iterator[T]:
+        if self._parent.options is not None:
+            return map(self._export, self._parent.options)
+        else:
+            return iter(())
+
+    def __reversed__(self) -> Iterator[T]:
+        if self._parent.options is not None:
+            return map(self._export, reversed(self._parent.options))
+        else:
+            return iter(())
+
+    @overload
+    def __getitem__(self, index: int) -> T: ...
+    @overload
+    def __getitem__(self, index: slice) -> MutableSequence[T]: ...
+
+    def __getitem__(self, index: Union[int, slice]) -> Union[T, MutableSequence[T]]:
+        if self._parent.options is None:
+            raise KeyError(index)
+        elif isinstance(index, slice):
+            return [self._export(x) for x in self._parent.options[index]]
+        else:
+            return self._export(self._parent.options[index])
+
+    @overload
+    def __setitem__(self, index: int, value: T) -> None: ...
+    @overload
+    def __setitem__(self, index: slice, value: Iterable[T]) -> None: ...
+
+    def __setitem__(self, index: Union[int, slice], value: Union[T, Iterable[T]]) -> None:
+        if self._parent.options is None:
+            raise KeyError(index)
+        elif isinstance(index, slice):  # Ignore, checker doesn't narrow value
+            self._parent.options[index] = [self._import(x) for x in value]  # type: ignore
+        else:
+            self._parent.options[index] = self._import(value)  # type: ignore
+
+    def __delitem__(self, index: Union[int, slice]) -> None:
+        if self._parent.options is None:
+            raise KeyError(index)
+        del self._parent.options[index]
+
+
 @attrs.define
 class KVDef(EntAttribute):
-    """Represents a keyvalue that may be set on entities
-
-    If the type is choices or spawnflags, ``val_list`` is required:
-    * For choices it's a list of (value, name, tags) tuples.
-    * For spawnflags it's a list of (bitflag, name, default, tags) tuples.
-    """
+    """Represents a keyvalue that may be set on entities."""
     name: str
     _type: Union[ValueTypes, str] = attrs.field(alias='type')
     disp_name: str
     default: str = ''
     desc: str = ''
-    val_list: Union[list[SpawnFlags], list[Choices], None] = None
+    options: Optional[list[KVOption]] = None  #: Only valid for CHOICES or SPAWNFLAGS types, holds the options.
     #: Causes Hammer to prevent this keyvalue from being changed.
     #: Doesn't force the value to the default though.
     readonly: bool = False
@@ -1095,32 +1256,6 @@ class KVDef(EntAttribute):
     reportable: bool = False
     #: Extension, marks keyvalues which are only used to preview things in Hammer.
     editor_only: bool = False
-
-    @property
-    def choices_list(self) -> list[Choices]:
-        """Check that the keyvalues are CHOICES type, and then return val_list.
-
-        This isolates the type ambiguity of the attr.
-        """
-        if self._type is not ValueTypes.CHOICES:
-            raise TypeError
-        if self.val_list is None:
-            lst: list[tuple[str, str, TagsSet]] = []
-            self.val_list = lst
-        return cast('list[Choices]', self.val_list)
-
-    @property
-    def flags_list(self) -> list[SpawnFlags]:
-        """Check that the keyvalues are SPAWNFLAGS type, and then return val_list.
-
-        This isolates the type ambiguity of the attr.
-        """
-        if self._type is not ValueTypes.SPAWNFLAGS:
-            raise TypeError
-        if self.val_list is None:
-            lst: list[SpawnFlags] = []
-            self.val_list = lst
-        return cast('list[SpawnFlags]', self.val_list)
 
     def copy(self) -> KVDef:
         """Create a duplicate of this keyvalue."""
@@ -1131,7 +1266,7 @@ class KVDef(EntAttribute):
             self.default,
             self.desc,
             # Always copy this.
-            self.val_list.copy() if self.val_list else None,
+            self.options.copy() if self.options else None,
             self.readonly,
             self.reportable,
             self.editor_only,
@@ -1146,21 +1281,97 @@ class KVDef(EntAttribute):
             self.disp_name,
             self.default,
             self.desc,
-            self.val_list.copy() if self.val_list else None,
+            self.options.copy() if self.options else None,
             self.readonly,
             self.reportable,
             self.editor_only,
         )
 
+    @staticmethod
+    def _choice_export(option: KVOption, /) -> Choices:
+        """Converter for val_list and choices_list."""
+        return (option.value, option.name, option.tags)
+
+    @staticmethod
+    def _choice_import(choice: Choices, /) -> KVOption:
+        """Converter for val_list and choices_list."""
+        value, name, tags = choice
+        return KVOption(value=value, name=name, tags=tags)
+
+    @staticmethod
+    def _flag_export(option: KVOption, /) -> SpawnFlags:
+        """Converter for val_list and flags_list."""
+        return (option.bitflag, option.name, option.default, option.tags)
+
+    @staticmethod
+    def _flag_import(flag: SpawnFlags, /) -> KVOption:
+        """Converter for val_list and flags_list."""
+        bitflag, name, default, tags = flag
+        return KVOption(bitflag=bitflag, name=name, default=default, tags=tags)
+
+    @property
+    @deprecated("Use KVDef.options instead.")
+    def val_list(self) -> Union[MutableSequence[SpawnFlags], MutableSequence[Choices], None]:
+        """Sequence of `tuple`s holding the valid spawnflag or choices options.
+
+        :deprecated: Use options instead, which stores `KVOption` instances.
+        """
+        if self.options is None:
+            self.options = []
+        if self._type is ValueTypes.CHOICES:
+            return _MapList(self, self._choice_import, self._choice_export)
+        elif self._type is ValueTypes.SPAWNFLAGS:
+            return _MapList(self, self._flag_import, self._flag_export)
+        else:
+            return None
+
+    # noinspection PyDeprecation
+    @val_list.setter
+    @deprecated("Use KVDef.options instead.")
+    def val_list(self, value: Union[MutableSequence[SpawnFlags], MutableSequence[Choices], None]) -> None:
+        if value is None:
+            self.options = None
+        elif self._type is ValueTypes.CHOICES:
+            # Type error if value is a MutableSequence[SpawnFlags] - that's fine.
+            self.options = [self._choice_import(tup) for tup in value]  # type: ignore
+        elif self._type is ValueTypes.SPAWNFLAGS:
+            self.options = [self._flag_import(tup) for tup in value]  # type: ignore
+        else:
+            raise ValueError(f'Only choices or flags KV types have options, got {self._type!r}')
+
+    @property
+    @deprecated("Use KVDef.options instead.")
+    def choices_list(self) -> MutableSequence[Choices]:
+        """Assert the keyvalues are CHOICES type, then return casted values.
+
+        :deprecated: Use options instead, which stores `KVOption` instances.
+        """
+        if self._type is not ValueTypes.CHOICES:
+            raise TypeError
+        return _MapList(self, self._choice_import, self._choice_export)
+
+    @property
+    @deprecated("Use KVDef.options instead.")
+    def flags_list(self) -> MutableSequence[SpawnFlags]:
+        """Assert the keyvalues are SPAWNFLAGS type, then return casted values.
+
+        :deprecated: Use options instead, which stores `KVOption` instances.
+        """
+        if self._type is not ValueTypes.SPAWNFLAGS:
+            raise TypeError
+        return _MapList(self, self._flag_import, self._flag_export)
+
     def known_options(self) -> Iterator[str]:
         """Use the default value and value list to determine values this can be set to."""
-        if self._type is ValueTypes.CHOICES:
-            options = {val_list[0] for val_list in self.choices_list}
+        if self._type is ValueTypes.CHOICES and self.options is not None:
+            options = {option.value for option in self.options}
             options.add(self.default)
             yield from options
         elif self._type is ValueTypes.SPAWNFLAGS:
-            for bitflag, name, default, tags in self.flags_list:
-                yield str(bitflag)
+            if self.options is not None:
+                for option in self.options:
+                    yield str(option.bitflag)
+            # Default is not used for this.
         else:
             yield self.default
 
@@ -1242,16 +1453,26 @@ class KVDef(EntAttribute):
             has_equal, _ = tok()
         attr_len = len(kv_vals)
         kv_desc = default = ''
-        if attr_len == 3:
-            disp_name, default, kv_desc = kv_vals
-        elif attr_len == 2:
-            disp_name, default = kv_vals
-        elif attr_len == 1:
-            [disp_name] = kv_vals
-        elif attr_len == 0:
-            disp_name = name
+        if val_typ is ValueTypes.SPAWNFLAGS:  # Defaults are not used for these.
+            if attr_len == 2:
+                disp_name, kv_desc = kv_vals
+            elif attr_len == 1:
+                [disp_name] = kv_vals
+            elif attr_len == 0:
+                disp_name = name
+            else:
+                raise tok.error('Too many attributes for flags keyvalue!\n{!r}', kv_vals)
         else:
-            raise tok.error('Too many attributes for keyvalue!\n{!r}', kv_vals)
+            if attr_len == 3:
+                disp_name, default, kv_desc = kv_vals
+            elif attr_len == 2:
+                disp_name, default = kv_vals
+            elif attr_len == 1:
+                [disp_name] = kv_vals
+            elif attr_len == 0:
+                disp_name = name
+            else:
+                raise tok.error('Too many attributes for keyvalue!\n{!r}', kv_vals)
         if val_typ is ValueTypes.BOOL:
             # These are old aliases, change them to proper booleans.
             if default.casefold() == 'yes':
@@ -1259,24 +1480,24 @@ class KVDef(EntAttribute):
             elif default.casefold() == 'no':
                 default = '0'
         # Read the choices in the [].
-        val_list: Union[list[Choices], list[SpawnFlags], None]
+        options: Optional[list[KVOption]]
         if isinstance(val_typ, ValueTypes) and val_typ.has_list:
             if has_equal is not Token.EQUALS:
                 raise tok.error('No list provided for "{}" value type!', val_typ.name)
             if val_typ is ValueTypes.CHOICES:
-                val_list = _parse_colon_array(
+                options = _parse_colon_array(
                     tok, error_desc,
                     'choices list', fgd.snippet_choices, _parse_choices,
                 )
             elif val_typ is ValueTypes.SPAWNFLAGS:
-                val_list = _parse_colon_array(
+                options = _parse_colon_array(
                     tok, error_desc,
                     'flags list', fgd.snippet_flags, _parse_flags,
                 )
             else:  # No others have a list.
                 raise AssertionError(val_typ)
         else:
-            val_list = None
+            options = None
             if has_equal is Token.EQUALS:
                 raise tok.error(
                     '"{}" value types can\'t have lists!',
@@ -1289,7 +1510,7 @@ class KVDef(EntAttribute):
             desc=kv_desc,
             disp_name=disp_name,
             default=default,
-            val_list=val_list,
+            options=options,
             readonly=is_readonly,
             reportable=show_in_report,
             editor_only=editor_only,
@@ -1322,8 +1543,8 @@ class KVDef(EntAttribute):
         if self.reportable and not old_report:
             file.write(' report')
 
-        if self._type is not ValueTypes.SPAWNFLAGS:
-            # Spawnflags never use names!
+        if self._type is not ValueTypes.SPAWNFLAGS or self.name.casefold() != 'spawnflags':
+            # Standard Spawnflags never use names!
             file.write(': ')
             # Name must be present, if not use the raw keyvalue name.
             _write_longstring(file, escape_quotes, self.disp_name or self.name, indent='\t')
@@ -1333,7 +1554,10 @@ class KVDef(EntAttribute):
             # This has to be present.
             default = '0'
 
-        if default:
+        if self._type is ValueTypes.SPAWNFLAGS:
+            if self.desc:
+                file.write(' : ')
+        elif default:
             default_str = str(default)
             # We can write unquoted integers, but nothing else.
             if all(x in '0123456789-' for x in default_str):
@@ -1351,36 +1575,40 @@ class KVDef(EntAttribute):
 
         if isinstance(self._type, ValueTypes) and self._type.has_list:
             file.write(' =\n\t\t[\n')
-            if self._type is ValueTypes.SPAWNFLAGS:
+            if self._type is ValueTypes.SPAWNFLAGS and self.options is not None:
                 # Empty tuple handles a None value.
-                for index, name, flag_default, tags in self.flags_list:
-                    file.write(f'\t\t{index}: ')
+                for option in (self.options or []):
+                    file.write(f'\t\t{option.bitflag}: ')
                     # Newlines aren't functional here, just replace.
-                    name = name.replace('\n', ' ')
+                    name = option.name.replace('\n', ' ')
                     _write_longstring(
                         file,
                         escape_quotes,
-                        f'[{index}] {name}' if label_spawnflags else name,
+                        f'[{option.bitflag}] {name}' if label_spawnflags else name,
                         indent='\t\t',
                     )
-                    file.write(' : 1' if flag_default else ' : 0')
-                    if tags and custom_syntax:
-                        file.write(f' [{", ".join(sorted(tags))}]\n')
+                    file.write(' : 1' if option.default else ' : 0')
+                    if option.desc:
+                        file.write(' : ')
+                        _write_longstring(file, escape_quotes, option.desc, indent='\t\t')
+                    if option.tags and custom_syntax:
+                        file.write(f' [{", ".join(sorted(option.tags))}]\n')
                     else:
                         file.write('\n')
             elif self._type is ValueTypes.CHOICES:
-                for value, name, tags in self.choices_list:
+                for option in (self.options or []):
                     # Numbers can be unquoted, everything else cannot.
                     try:
-                        float(value)
+                        float(option.value)
+                        value = option.value
                     except ValueError:
-                        value = f'"{value}"'
+                        value = f'"{option.value}"'
 
                     file.write(f'\t\t{value}: ')
                     # Newlines aren't functional here, just replace.
-                    _write_longstring(file, False, name.replace('\n', ' '), indent='\t\t')
-                    if tags and custom_syntax:
-                        file.write(f' [{", ".join(sorted(tags))}]\n')
+                    _write_longstring(file, False, option.name.replace('\n', ' '), indent='\t\t')
+                    if option.tags and custom_syntax:
+                        file.write(f' [{", ".join(sorted(option.tags))}]\n')
                     else:
                         file.write('\n')
             else:
@@ -2210,13 +2438,12 @@ class EntityDef:
                 ):
                     if match_tags(tags, key_tag):
                         category[key] = {frozenset(): value}
-                        if isinstance(value, KVDef) and value.val_list:
+                        if isinstance(value, KVDef) and value.options:
                             # Filter the value list as well, then discard tags.
-                            # Use slicing/negative index to preserve the same number of args
-                            value.val_list = [  # pyright: ignore
-                                (*val, frozenset())
-                                for (*val, tag) in value.val_list
-                                if match_tags(tags, tag)
+                            value.options = [
+                                attrs.evolve(option, tags=frozenset())
+                                for option in value.options
+                                if match_tags(tags, option.tags)
                             ]
                         break
                 else:
@@ -2387,6 +2614,8 @@ class FGD:
     mat_exclusions: set[PurePosixPath]
     # Additional dirs restricted to specific engines with tags.
     tagged_mat_exclusions: dict[TagsSet, set[PurePosixPath]]
+    # All color vars which are defined.
+    color_vars: dict[tuple[str, TagsSet], ColorVar]
 
     # Automatic visgroups.
     # The way Valve implemented this is rather strange, so we need to match
@@ -2398,8 +2627,8 @@ class FGD:
     # Snippets are named sections of syntax that can be reused.
     # Each is identified by a source filename, and a lookup key.
     snippet_desc: SnippetDict[str]
-    snippet_choices: SnippetDict[Sequence[Choices]]
-    snippet_flags: SnippetDict[Sequence[SpawnFlags]]
+    snippet_choices: SnippetDict[Sequence[KVOption]]
+    snippet_flags: SnippetDict[Sequence[KVOption]]
     snippet_input: SnippetDict[tuple[TagsSet, IODef]]
     snippet_output: SnippetDict[tuple[TagsSet, IODef]]
     snippet_keyvalue: SnippetDict[tuple[TagsSet, KVDef]]
@@ -2412,6 +2641,7 @@ class FGD:
         self.mat_exclusions = set()
         self.tagged_mat_exclusions = defaultdict(set)
         self.auto_visgroups = {}
+        self.color_vars = {}
 
         self.snippet_desc = {}
         self.snippet_choices = {}
@@ -2541,12 +2771,11 @@ class FGD:
                         elif kv.type.has_list and ent_kv_map[tag].type is kv.type:
                             # If both are lists of the same type, merge those. This is mainly
                             # for spawnflags.
-                            targ_list = ent_kv_map[tag].val_list
-                            if targ_list is not None and kv.val_list is not None:
-                                for val in kv.val_list:
+                            targ_list = ent_kv_map[tag].options
+                            if targ_list is not None and kv.options is not None:
+                                for val in kv.options:
                                     if val not in targ_list:
-                                        # Type checker can't know type attr indicates val_list type.
-                                        targ_list.append(val)  # type: ignore
+                                        targ_list.append(val)
 
                     if name not in keyvalue_names:
                         base_kv.append(name)
@@ -2609,6 +2838,11 @@ class FGD:
 
         if self.map_size_min != self.map_size_max:
             file.write(f'@mapsize({self.map_size_min}, {self.map_size_max})\n\n')
+
+        if self.color_vars:
+            for color_var in self.color_vars.values():
+                color_var.export(file, custom_syntax)
+            file.write('\n')
 
         if self.mat_exclusions:
             file.write('@MaterialExclusion\n\t[\n')
@@ -2807,6 +3041,10 @@ class FGD:
 
                 elif token_value == '@snippet':
                     Snippet.parse(self, file.path, tokeniser)
+                elif token_value == '@colorvar':
+                    # noinspection PyProtectedMember
+                    color_var = ColorVar._parse(tokeniser)
+                    self.color_vars[color_var.name, color_var.tags] = color_var
 
                 # Entity definition...
                 elif token_value[:1] == '@':
@@ -2944,13 +3182,17 @@ class ResourceCtx:
         # Strip extension, and normalise folder separators.
         if mapname.casefold().endswith(('.bsp', '.vmf', '.vmm', '.vmx')):
             mapname = mapname[:-4]
+        # If this is an FGD or Mapping __getitem__ is the appropriate callable, otherwise
+        # it must already be callable.
+        if isinstance(fgd, FGD) or isinstance(fgd, Mapping):
+            getter_func = fgd.__getitem__
+        else:
+            getter_func = fgd
         self.__attrs_init__(  # pyright: ignore
             frozenset({tag.upper() for tag in tags}),
             fsys,
             mapname.replace('\\', '/'),
-            # If this is an FGD or Mapping __getitem__ is the appropriate callable, otherwise
-            # it must already be callable.
-            getattr(fgd, '__getitem__', cast(_GetFGDFunc, fgd)),
+            getter_func,
             funcs,
         )
 
@@ -2997,7 +3239,7 @@ HELPER_IMPL: dict[HelperTypes, type[Helper]] = {}
 # reloaded it'll be using the old classes, breaking our registration.
 try:
     del sys.modules['srctools._fgd_helpers']
-    delattr(srctools, '_fgd_helpers')  # No static analysis of this.
+    del srctools._fgd_helpers  # pyright: ignore  # noqa
 except (KeyError, AttributeError):
     pass
 
